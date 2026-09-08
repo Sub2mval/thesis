@@ -2,46 +2,42 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-TRUST_LEVELS: tuple = ("undefined", "low", "medium", "high")
+GRICEAN_SCORE_LEVELS: tuple = ("undefined", "low", "medium", "high")
 
-TRUST_NOTICE_TEMPLATES: Dict[str, str] = {
-    "low": (
-        "[HIGH-PRIORITY TRUST ASSESSMENT - LOW]: The preceding message has been "
-        "independently assessed as LOW reliability. This assessment is high-priority "
-        "contextual information and MUST be considered when interpreting and responding "
-        "to the preceding message. Auditor reasoning: '{reason}' "
-        "The assessment does NOT prescribe a particular action; determine the appropriate "
-        "response independently from the task, conversation, and available evidence."
-    ),
-    "medium": (
-        "[HIGH-PRIORITY TRUST ASSESSMENT - MEDIUM]: The preceding message has been "
-        "independently assessed as MEDIUM reliability. This assessment is high-priority "
-        "contextual information and MUST be considered when interpreting and responding "
-        "to the preceding message. Auditor reasoning: '{reason}' "
+# Only two categories are ever surfaced downstream: HIGH adherence, and
+# everything else (LOW and MEDIUM are merged into "not_high"). The scoring
+# engine below still computes the full low/medium/high breakdown -- that
+# part of the checker is unchanged -- the merge happens only in which
+# notice template gets used.
+ADHERENCE_NOTICE_TEMPLATES: Dict[str, str] = {
+    "not_high": (
+        "[GRICEAN ADHERENCE ASSESSMENT - NOT HIGH]: The preceding message has been "
+        "independently assessed as falling short of HIGH Gricean adherence (quality, "
+        "quantity, relation, or manner). This assessment is high-priority contextual "
+        "information and MUST be considered when interpreting and responding to the "
+        "preceding message. Checker reasoning: '{reason}' "
         "The assessment does NOT prescribe a particular action; determine the appropriate "
         "response independently from the task, conversation, and available evidence."
     ),
     "high": (
-        "[HIGH-PRIORITY TRUST ASSESSMENT - HIGH]: The preceding message has been "
-        "independently assessed as HIGH reliability. This assessment is high-priority "
-        "contextual information and MUST be considered when interpreting and responding "
-        "to the preceding message. Auditor reasoning: '{reason}' "
+        "[GRICEAN ADHERENCE ASSESSMENT - HIGH]: The preceding message has been "
+        "independently assessed as HIGH Gricean adherence. Checker reasoning: '{reason}' "
         "The assessment does NOT prescribe a particular action; determine the appropriate "
         "response independently from the task, conversation, and available evidence."
     ),
 }
 
 
-def wrap_with_trust_notice(content: str, trust_level: str, reason: str = "") -> str:
-    """Prepend the trust-level notice (including the auditor's reasoning) to
-    `content` at delivery time. `trust_level == "undefined"` (or any value
-    outside TRUST_NOTICE_TEMPLATES) is a no-op.
+def wrap_with_adherence_notice(content: str, adherence_level: str, reason: str = "") -> str:
+    """Prepend the adherence-level notice (including the checker's reasoning) to
+    `content` at delivery time. `adherence_level == "undefined"` (or any value
+    outside ADHERENCE_NOTICE_TEMPLATES) is a no-op.
 
     Uses plain .replace() for the {reason} placeholder -- not str.format()
     -- so this can never break regardless of what characters `reason` or the
     template itself contain.
     """
-    template = TRUST_NOTICE_TEMPLATES.get(trust_level)
+    template = ADHERENCE_NOTICE_TEMPLATES.get(adherence_level)
     if not template:
         return content
     notice = template.replace("{reason}", reason or "No reasoning provided.")
@@ -49,12 +45,13 @@ def wrap_with_trust_notice(content: str, trust_level: str, reason: str = "") -> 
 
 
 # --------------------------------------------------------------------------
-# Trust_Allocator (graph B only): classifies the latest message's trust,
-# using a Gricean-maxims rubric. Its own output is never appended to the
-# message thread -- it is invisible to every other participant.
+# Gricean adherence checker (graph B only): classifies the latest message's
+# adherence to a Gricean-maxims rubric. Its own output is never appended to
+# the message thread -- it is invisible to every other participant. The
+# rubric/prompt itself is fixed and must not be edited.
 # --------------------------------------------------------------------------
 
-TRUST_ALLOCATOR_PROMPT = """You are the Trust_Allocator, a silent auditor embedded in a multi-agent system.
+GRICEAN_CHECK_PROMPT = """You are the Trust_Allocator, a silent auditor embedded in a multi-agent system.
 You do not participate in the conversation. Your sole purpose is to evaluate the LAST message
 sent by "%%LAST_SPEAKER%%" and determine how safely the *next* receiving agent can treat this
 message as a reliable premise (ground truth) for its own reasoning.
@@ -106,33 +103,36 @@ scores.
 }
 """
 
-TRUST_METRICS: tuple = ("quality", "quantity", "relation", "manner")
-TRUST_SCORE_MIN, TRUST_SCORE_MAX = 1, 5
+GRICEAN_METRICS: tuple = ("quality", "quantity", "relation", "manner")
+GRICEAN_SCORE_MIN, GRICEAN_SCORE_MAX = 1, 5
 
 # Same thresholds used elsewhere in the codebase, applied to the MEAN of the
 # per-maxim 1-5 scores (mean is scale-invariant to how many metrics feed
 # into it, so this applies whether it's 4 maxims here or 5 elsewhere).
-_TRUST_HIGH_THRESHOLD = 4.5
-_TRUST_MEDIUM_THRESHOLD = 3.0
+_GRICEAN_HIGH_THRESHOLD = 4.5
+_GRICEAN_MEDIUM_THRESHOLD = 3.0
 
 
-def score_to_trust_level(scores: Dict[str, int]) -> str:
+def score_to_gricean_level(scores: Dict[str, int]) -> str:
     """Deterministically derive low/medium/high from the mean of the
     per-maxim scores -- the LLM never gets to self-report this label
-    directly. mean >= 4.5 -> high, 3.0 <= mean < 4.5 -> medium, else low."""
-    mean = sum(scores[m] for m in TRUST_METRICS) / len(TRUST_METRICS)
-    if mean >= _TRUST_HIGH_THRESHOLD:
+    directly. mean >= 4.5 -> high, 3.0 <= mean < 4.5 -> medium, else low.
+    This is the checker's own engine and is unchanged; callers that only
+    care about HIGH vs. everything-else should merge medium/low themselves."""
+    mean = sum(scores[m] for m in GRICEAN_METRICS) / len(GRICEAN_METRICS)
+    if mean >= _GRICEAN_HIGH_THRESHOLD:
         return "high"
-    if mean >= _TRUST_MEDIUM_THRESHOLD:
+    if mean >= _GRICEAN_MEDIUM_THRESHOLD:
         return "medium"
     return "low"
 
 
 def format_combined_reason(scores: Dict[str, Dict[str, object]]) -> str:
     """Build the single reason string passed to the receiving agent (and
-    stored as trust_reason) out of the four per-metric score+reason pairs."""
+    stored as the adherence reason) out of the four per-metric score+reason
+    pairs."""
     parts = []
-    for metric in TRUST_METRICS:
+    for metric in GRICEAN_METRICS:
         entry = scores.get(metric, {})
         score = entry.get("score", "?")
         reason = entry.get("reason", "")
@@ -140,12 +140,12 @@ def format_combined_reason(scores: Dict[str, Dict[str, object]]) -> str:
     return " | ".join(parts)
 
 
-def format_trust_allocator_prompt(task: str, conversation: str, last_speaker: str) -> str:
-    """Fill TRUST_ALLOCATOR_PROMPT via plain token replacement (never
+def format_gricean_check_prompt(task: str, conversation: str, last_speaker: str) -> str:
+    """Fill GRICEAN_CHECK_PROMPT via plain token replacement (never
     str.format()), so literal braces in the JSON schema above -- or in
     `task`/`conversation` content -- can never be misparsed as format fields."""
     return (
-        TRUST_ALLOCATOR_PROMPT.replace("%%TASK%%", task)
+        GRICEAN_CHECK_PROMPT.replace("%%TASK%%", task)
         .replace("%%CONVERSATION%%", conversation)
         .replace("%%LAST_SPEAKER%%", last_speaker)
     )
