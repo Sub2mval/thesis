@@ -10,7 +10,15 @@
 #
 # Dropped vs. the original long version (plumbing only, not mechanism):
 # multi-model/key routing config schema, YAML config loading, token/usage
-# bookkeeping, multimodal attachments, tenacity's retry_error_callback.
+# bookkeeping, tenacity's retry_error_callback.
+#
+# Duck-types against gaia_utils.py rather than importing it: init_agents
+# accepts an `attachment` dict shaped exactly like load_attachment()'s
+# return value, and aggregate() appends config["answer_format_instruction"]
+# verbatim if present (pass gaia_utils.GAIA_ANSWER_FORMAT_INSTRUCTION there
+# to get "FINAL ANSWER: ..." lines that extract_gaia_answer/
+# gaia_question_scorer can consume). Neither is imported here so this file
+# has no hard GAIA dependency.
 
 import json
 import random
@@ -31,7 +39,7 @@ from trust_allocator import (
     wrap_with_trust_notice,
 )
 
-Message = Dict[str, str]
+Message = Dict[str, Any]  # role/content, plus optionally images/audio for attachments
 
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
@@ -79,10 +87,27 @@ class DebateState(TypedDict):
     final_answer: Optional[str]
     config: Dict[str, Any]
     use_trust: bool
+    attachment: Optional[Dict[str, Any]]  # shape of gaia_utils.load_attachment()'s return value
+
+
+def _build_initial_message(query: str, attachment: Optional[Dict[str, Any]]) -> Message:
+    msg: Message = {"role": "user", "content": f"{query}\nState your final answer clearly at the end."}
+    if not attachment:
+        return msg
+    if attachment.get("text"):
+        note = f" {attachment['note']}" if attachment.get("note") else ""
+        msg["content"] += f"\n\nAttached file contents:{note}\n\n{attachment['text']}"
+    if attachment.get("images_b64"):
+        msg["images"] = attachment["images_b64"]
+    if attachment.get("audio_b64"):
+        msg["audio"] = attachment["audio_b64"]
+    if attachment.get("kind") == "unsupported" and attachment.get("note"):
+        msg["content"] += f"\n\n[Note: an attached file could not be included -- {attachment['note']}]"
+    return msg
 
 
 def init_agents(state: DebateState) -> Dict[str, Any]:
-    msg = {"role": "user", "content": f"{state['query']}\nState your final answer clearly at the end."}
+    msg = _build_initial_message(state["query"], state.get("attachment"))
     return {"contexts": [[dict(msg)] for _ in range(state["agents_num"])], "round": 0, "agent_idx": 0, "trust": {}}
 
 
@@ -113,6 +138,9 @@ def trust_check(state: DebateState) -> Dict[str, Any]:
 def aggregate(state: DebateState) -> Dict[str, Any]:
     answers = "\n\n".join(f"Solution {i + 1}:\n{c[-1]['content']}" for i, c in enumerate(state["contexts"]))
     prompt = f"Task:\n{state['query']}\n\n{answers}\n\nReason over these solutions and give one final answer."
+    instruction = state["config"].get("answer_format_instruction")
+    if instruction:
+        prompt += f"\n\n{instruction}"
     return {"final_answer": call_llm([{"role": "user", "content": prompt}], state["config"])}
 
 
@@ -142,11 +170,12 @@ def build_graph(checkpointer=None):
 
 
 def run_debate(query: str, config: Dict[str, Any], agents_num: int = 3, rounds_num: int = 2,
-               use_trust: bool = False) -> str:
+               use_trust: bool = False, attachment: Optional[Dict[str, Any]] = None) -> str:
     app = build_graph()
     result = app.invoke(
         {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
-         "contexts": [], "trust": {}, "final_answer": None, "config": config, "use_trust": use_trust},
+         "contexts": [], "trust": {}, "final_answer": None, "config": config, "use_trust": use_trust,
+         "attachment": attachment},
         config={"recursion_limit": 300},
     )
     return result["final_answer"]
