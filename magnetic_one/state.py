@@ -1,5 +1,9 @@
 """
 State schema for the LangGraph re-implementation of Magentic-One.
+
+Every node in orchestrator_graph.py receives and returns a `MagenticState`
+(a plain dict matching this TypedDict) -- nodes never hold state
+themselves, so a run is fully inspectable/resumable via the checkpointer.
 """
 
 from __future__ import annotations
@@ -8,19 +12,40 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 
 class ThreadMessage(TypedDict):
+    """One entry in the permanent, shared conversation -- visible to every
+    node and every worker agent that reads `messages`."""
+
     source: str
     content: str
 
 
-class TrustLogEntry(TypedDict, total=False):
+class AdherenceLogEntry(TypedDict, total=False):
+    """One row of the permanent audit trail the Gricean adherence checker
+    (gricean_check.py) leaves behind. Never read back into a prompt --
+    it exists purely for post-hoc inspection/debugging."""
+
     step: int
     message_index: int
     evaluated_source: str
-    trust_level: str
+    adherence_level: str  # "high" | "not_high"
     reason: str
-    scores: Dict[str, Dict[str, Any]]  # {"quality": {"score": 1-5, "reason": ...}, "quantity": {...}, ...}
+    scores: Dict[str, Dict[str, Any]]  # {"quality": {"score": 1-5, "reason": ...}, ...}
 
 
+class ReflectionLogEntry(TypedDict, total=False):
+    """One row of the reflection audit trail. A reflection is generated
+    once, used once (folded into the single upcoming call for whichever
+    node is about to consume the flagged message, via
+    `state["pending_reflection"]`), and afterwards only kept here for
+    audit purposes. No node ever reads an old entry from this list back
+    into a prompt, so a reflection never resurfaces on a later turn, and
+    one agent's reflection is never visible to another agent."""
+
+    step: int
+    message_index: int
+    consuming_node: str  # which node's very next call this reflection was generated for
+    reason: str  # the adherence checker's reasoning that triggered this reflection
+    reflection: str
 
 
 class LLMCallUsage(TypedDict, total=False):
@@ -72,13 +97,25 @@ class MagenticState(TypedDict, total=False):
     final_answer: Optional[str]
     termination_reason: Optional[str]
 
-    # --- trust extension ---
-    trust_level: str
-    # The Trust_Allocator's own reasoning for the current trust_level, passed
-    # to the receiving agent alongside the trust label itself.
-    trust_reason: str
-    # The four Gricean-maxim scores (1-5 each) that produced the current
-    # trust_level, e.g. {"quality": {"score": 4, "reason": "..."}, ...}.
-    trust_scores: Dict[str, Any]
-    trust_history: List[TrustLogEntry]
-    route_after_trust: str
+    # --- Gricean adherence + reflection extension ---
+    # Whether the checker/reflection loop runs at all this run. One
+    # compiled graph serves both the "baseline" and "checked" behaviour --
+    # see gricean_check_node in orchestrator_nodes.py -- so this is a
+    # per-run flag on the state, not a build-time graph choice.
+    enable_gricean_check: bool
+    # Always describes the *last* message in `messages` as of the most
+    # recent gricean_check_node run.
+    adherence_level: str  # "high" | "not_high"
+    adherence_reason: str
+    adherence_scores: Dict[str, Any]
+    adherence_history: List[AdherenceLogEntry]
+    # Set by gricean_check_node, consumed (and effectively cleared, since
+    # the next gricean_check_node run always overwrites it) by whichever
+    # node runs immediately after. None whenever the last message cleared
+    # HIGH adherence, so that node behaves exactly as if no check existed.
+    pending_reflection: Optional[str]
+    reflection_history: List[ReflectionLogEntry]
+    # gricean_check_node sits on two edges (worker -> progress_ledger, and
+    # progress_ledger -> call_agent) and needs to know which one sent it
+    # here so it can route back correctly once it's done.
+    next_after_check: str
