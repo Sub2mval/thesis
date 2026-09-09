@@ -1,30 +1,35 @@
 """
-Graph topology for the LangGraph re-implementation of Magentic-One.
+Graph topology: one node per agent, matching the reference diagram.
 
-    Question
-       |
-       v
-  create_task_ledger -> init_outer_loop -.
-                                          v
-                  .------------------ gricean_check <---------.
-                  |                    (checks the LAST        |
-                  v                     message only)          |
-           progress_ledger                                 call_agent
-             (the "Orchestrator                          (WebSurfer / Coder /
-              Agent" hub)  ---> update_task_ledger            FileSurfer / terminal)
-                  |             (replans, loops back      ^
-                  |              to init_outer_loop)       |
-                  '-----------------------------------------'
-                  |
-                  v
-             final_answer -> Answer
+                              Question
+                                 |
+                                 v
+                   .---> MagenticOneOrchestrator
+                   |     (owns Task Ledger & Progress
+                   |      Ledger -- both live in
+                   |      MagenticState, not as nodes)
+                   |             |
+                   |             v
+                   |      Gricean_Checker  <-------------------.
+                   |     (scores the LAST                      |
+                   |      message only)                        |
+                   |             |                              |
+                   |             v                              |
+                   |   FileSurfer / WebSurfer / Coder /          |
+                   |   ComputerTerminal (whichever the            |
+                   |   Orchestrator picked as next_speaker) ------'
+                   |
+                   '------------------------------------ (loops back)
+                                 |
+                                 v
+                            Answer (END)
 
-One graph, always -- `enable_gricean_check` (see state.py) is a per-run
-flag read *inside* gricean_check_node, not a build-time choice, so there
-is no separate "baseline" topology to keep in sync with this one. Every
-message hand-off (worker -> progress_ledger, and progress_ledger ->
-call_agent) passes through the same gricean_check node; see
-orchestrator_nodes.py for what it does with a flagged message.
+Every hand-off, in both directions, passes through Gricean_Checker -- see
+gricean_checker.py for what happens to a flagged message. `enable_gricean_check`
+(a per-run state flag, not a build-time choice -- see state.py) never
+changes the graph's shape: Gricean_Checker always scores every message
+either way, so there is only ever one compiled graph. The flag only gates
+whether a low score ever turns into a reflection that reaches an agent.
 """
 
 from __future__ import annotations
@@ -35,8 +40,9 @@ from autogen_core.models import ChatCompletionClient
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
-from context_utils import AgentCaller
-from orchestrator_nodes import build_orchestrator_nodes
+from agent_nodes import build_agent_nodes
+from context_utils import AgentCaller, ORCHESTRATOR_NAME
+from gricean_check import GRICEAN_CHECKER_NAME
 from prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
 from state import MagenticState
 
@@ -51,7 +57,7 @@ def build_magentic_one_graph(
     gricean_model_client: Optional[ChatCompletionClient] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
 ):
-    nodes = build_orchestrator_nodes(
+    nodes = build_agent_nodes(
         model_client=model_client,
         gricean_client=gricean_model_client or model_client,
         agent_callers=agent_callers,
@@ -60,36 +66,36 @@ def build_magentic_one_graph(
         max_stalls=max_stalls,
         final_answer_prompt=final_answer_prompt,
     )
-
-    def route_after_progress_ledger(state: MagenticState) -> str:
-        if state.get("n_rounds", 0) > state.get("max_rounds", max_rounds):
-            return "final_answer"
-        if state["is_satisfied"]:
-            return "final_answer"
-        if state["n_stalls"] >= state.get("max_stalls", max_stalls):
-            return "update_task_ledger"
-        return "gricean_check"
-
-    def route_after_check(state: MagenticState) -> str:
-        return state["next_after_check"]
+    worker_names = list(agent_callers.keys())
 
     graph = StateGraph(MagenticState)
     for name, fn in nodes.items():
         graph.add_node(name, fn)
 
-    graph.set_entry_point("create_task_ledger")
-    graph.add_edge("create_task_ledger", "init_outer_loop")
-    graph.add_edge("init_outer_loop", "gricean_check")
+    graph.set_entry_point(ORCHESTRATOR_NAME)
+
+    # The Orchestrator either dispatches (-> Gricean_Checker, which then
+    # routes on to whichever worker it picked) or has written a final
+    # answer (-> END). Nothing else ever routes straight to END.
     graph.add_conditional_edges(
-        "gricean_check", route_after_check, {"progress_ledger": "progress_ledger", "call_agent": "call_agent"}
+        ORCHESTRATOR_NAME,
+        lambda s: END if s.get("final_answer") is not None else GRICEAN_CHECKER_NAME,
+        {GRICEAN_CHECKER_NAME: GRICEAN_CHECKER_NAME, END: END},
     )
+
+    # Every worker unconditionally hands its response back through the
+    # checker -- who receives it next depends on `next_after_check`, set
+    # by the worker node itself (always ORCHESTRATOR_NAME).
+    for name in worker_names:
+        graph.add_edge(name, GRICEAN_CHECKER_NAME)
+
+    # Gricean_Checker routes to whoever `next_after_check` names: the
+    # Orchestrator (after checking a worker's response) or the target
+    # worker (after checking the Orchestrator's instruction to it).
     graph.add_conditional_edges(
-        "progress_ledger",
-        route_after_progress_ledger,
-        {"final_answer": "final_answer", "update_task_ledger": "update_task_ledger", "gricean_check": "gricean_check"},
+        GRICEAN_CHECKER_NAME,
+        lambda s: s["next_after_check"],
+        {ORCHESTRATOR_NAME: ORCHESTRATOR_NAME, **{name: name for name in worker_names}},
     )
-    graph.add_edge("call_agent", "gricean_check")
-    graph.add_edge("update_task_ledger", "init_outer_loop")
-    graph.add_edge("final_answer", END)
 
     return graph.compile(checkpointer=checkpointer)

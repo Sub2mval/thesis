@@ -9,17 +9,17 @@ derived label space shrank from three values to two.
 
 Unlike the old design, a not_high result no longer gets stitched into the
 flagged message's text (the old `wrap_with_trust_notice`). Instead
-orchestrator_nodes.gricean_check_node uses `format_reflection_prompt` below
-to have the *consuming* node reflect once, out-of-band, before it acts --
-see state.py's `pending_reflection` / `reflection_history` for how that
-reflection is threaded through and why it never resurfaces later.
+gricean_checker.build_gricean_checker_node uses `format_reflection_prompt`
+below to have the *receiving* agent reflect once, out-of-band, before it
+acts -- see state.py's `pending_reflection` / `reflection_history` for how
+that reflection is threaded through and why it never resurfaces later.
 """
 
 from __future__ import annotations
 
 from typing import Dict, List
 
-GRICEAN_CHECKER_NAME = "Gricean_Adherence_Checker"
+GRICEAN_CHECKER_NAME = "Gricean_Checker"
 GRICEAN_METRICS: tuple = ("quality", "quantity", "relation", "manner")
 SCORE_MIN, SCORE_MAX = 1, 5
 
@@ -38,8 +38,8 @@ def score_to_adherence_level(scores: Dict[str, int]) -> str:
 
 
 def format_combined_reason(scores: Dict[str, Dict[str, object]]) -> str:
-    """Build the single reason string used both in the audit log and as
-    the reflection prompt's explanation of why a message was flagged."""
+    """Build the compact, single-line reason string used in the audit log
+    (`gricean_history`) -- pipe-joined so one log entry stays one line."""
     parts = []
     for metric in GRICEAN_METRICS:
         entry = scores.get(metric, {})
@@ -47,6 +47,20 @@ def format_combined_reason(scores: Dict[str, Dict[str, object]]) -> str:
         reason = entry.get("reason", "")
         parts.append(f"{metric.capitalize()} {score}/5 - {reason}")
     return " | ".join(parts)
+
+
+def format_scores_breakdown(scores: Dict[str, Dict[str, object]]) -> str:
+    """Multi-line, per-maxim breakdown of scores + reasons -- what the
+    reflection prompt shows the receiving agent. More scannable than
+    format_combined_reason's compact pipe-joined form, which is meant for
+    a one-line audit-log entry rather than for an agent to read and act on."""
+    lines = []
+    for metric in GRICEAN_METRICS:
+        entry = scores.get(metric, {})
+        score = entry.get("score", "?")
+        reason = entry.get("reason", "")
+        lines.append(f"- {metric.capitalize()}: {score}/5 -- {reason}")
+    return "\n".join(lines)
 
 
 def format_conversation(messages: List[Dict[str, str]]) -> str:
@@ -67,13 +81,16 @@ def format_gricean_check_prompt(task: str, conversation: str, last_speaker: str)
     )
 
 
-def format_reflection_prompt(source: str, message: str, reason: str) -> str:
-    """Fill REFLECTION_PROMPT for the node about to consume a flagged
-    message. Also uses plain .replace(), for the same reason as above."""
+def format_reflection_prompt(source: str, message: str, scores: Dict[str, Dict[str, object]]) -> str:
+    """Fill REFLECTION_PROMPT for the agent about to receive a flagged
+    message, with the full per-maxim score + reasoning breakdown (not
+    just the compact audit-log string) so the reflecting agent has
+    everything the checker considered, not just its conclusion. Also uses
+    plain .replace(), for the same reason as above."""
     return (
         REFLECTION_PROMPT.replace("%%SOURCE%%", source)
         .replace("%%MESSAGE%%", message)
-        .replace("%%REASON%%", reason)
+        .replace("%%FEEDBACK%%", format_scores_breakdown(scores))
     )
 
 
@@ -82,7 +99,7 @@ def format_reflection_prompt(source: str, message: str, reason: str) -> str:
 # see the project's review guidelines.
 # --------------------------------------------------------------------------
 
-GRICEAN_CHECK_PROMPT = """You are the Gricean_Adherence_Checker, a silent auditor embedded in a multi-agent system.
+GRICEAN_CHECK_PROMPT = """You are the Gricean_Checker, a silent auditor embedded in a multi-agent system.
 You do not participate in the conversation. Your sole purpose is to evaluate the LAST message
 sent by "%%LAST_SPEAKER%%" and determine how safely the *next* receiving agent can treat this
 message as a reliable premise (ground truth) for its own reasoning.
@@ -123,17 +140,21 @@ report an overall adherence label yourself; that is derived automatically from y
 }
 """
 
-REFLECTION_PROMPT = """You are about to act on the following message from "%%SOURCE%%":
+REFLECTION_PROMPT = """You are about to receive the following message from "%%SOURCE%%":
 
 %%MESSAGE%%
 
-Before responding, note that an independent Gricean-maxims adherence check flagged this message
-as NOT HIGH adherence -- it may be under-evidenced, off-topic, over/under-informative, or unclear.
-The checker's reasoning was:
+An independent Gricean-maxims adherence check has flagged this message as NOT HIGH adherence.
+Here is the full per-maxim breakdown the checker produced:
 
-%%REASON%%
+%%FEEDBACK%%
 
-Reflect briefly (a few sentences) on what you should be cautious about, or how you should
-calibrate your next response, given this. This reflection is for your own internal use only --
-it will not be shown to any other agent and will not become part of the shared conversation.
+This is a reflection loop, not a warning to just note and move past. Decide concretely how you
+will act to counteract the specific violation(s) named above -- e.g. asking a clarifying question
+if the message was ambiguous, pointing out an unsupported claim instead of building on it,
+re-stating what you actually need if the message was under-informative, or ignoring an
+off-topic tangent and returning to the task. Your goal is for YOUR OWN next message to itself
+score HIGH adherence when it is checked. Keep this reflection to a few sentences; it is for your
+own internal use only -- it will not be shown to any other agent and will not become part of the
+shared conversation.
 """

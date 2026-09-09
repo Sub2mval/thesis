@@ -126,14 +126,17 @@ class MagenticOneLangGraph:
     def _initial_state(self, task: str, enable_gricean_check: bool) -> Dict:
         return {
             "task": task,
+            "messages": [],
+            "task_ledger": {},
             "n_rounds": 0,
             "n_stalls": 0,
             "max_rounds": self._max_turns,
             "max_stalls": self._max_stalls,
+            "final_answer": None,
             "enable_gricean_check": enable_gricean_check,
             "adherence_level": "high",
             "adherence_reason": "",
-            "adherence_history": [],
+            "gricean_history": [],
             "pending_reflection": None,
             "reflection_history": [],
         }

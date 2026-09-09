@@ -1,13 +1,12 @@
 """
-Generic wiring shared by the orchestrator's nodes: turning the permanent
-`messages` thread into an LLM-ready context, describing the team, and
-adapting AutoGen ChatAgents so the graph can call them uniformly.
+Generic wiring shared across agent nodes: turning MessageHistory into an
+LLM-ready context, describing the team, and adapting AutoGen ChatAgents so
+the graph can call them uniformly.
 
-Nothing here is Gricean-check-specific -- it's the same plumbing the
-orchestrator needed before the reflection loop existed. (Compare to the
-old `_thread_to_context`, which *did* know about trust notices; that
-responsibility now lives with the individual nodes in orchestrator_nodes.py,
-which inject a one-off reflection into their own context when needed.)
+Nothing here is Gricean-check-specific -- reflection injection is each
+agent node's own responsibility (orchestrator_agent.py / worker_agent.py
+prepend `state["pending_reflection"]` to their own context/instruction
+when it's set); this module just builds the plain, unmodified context.
 """
 
 from __future__ import annotations

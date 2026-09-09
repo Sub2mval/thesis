@@ -1,9 +1,12 @@
 """
 State schema for the LangGraph re-implementation of Magentic-One.
 
-Every node in orchestrator_graph.py receives and returns a `MagenticState`
-(a plain dict matching this TypedDict) -- nodes never hold state
-themselves, so a run is fully inspectable/resumable via the checkpointer.
+Every node in this graph IS an agent (MagenticOneOrchestrator, each worker,
+Gricean_Checker -- see orchestrator_graph.py). Everything that isn't an
+agent -- the Task Ledger, the Progress Ledger, the message history, and
+the Gricean adherence log -- lives here instead, as plain data every node
+reads and returns. Nodes never hold state themselves, so a run is fully
+inspectable/resumable via the checkpointer.
 """
 
 from __future__ import annotations
@@ -12,17 +15,25 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 
 class ThreadMessage(TypedDict):
-    """One entry in the permanent, shared conversation -- visible to every
-    node and every worker agent that reads `messages`."""
+    """One entry in MessageHistory -- permanent, shared, visible to every
+    agent that reads `messages`."""
 
     source: str
     content: str
 
 
-class AdherenceLogEntry(TypedDict, total=False):
-    """One row of the permanent audit trail the Gricean adherence checker
-    (gricean_check.py) leaves behind. Never read back into a prompt --
-    it exists purely for post-hoc inspection/debugging."""
+class TaskLedger(TypedDict, total=False):
+    """The Orchestrator's own facts + plan for the task. Rebuilt from
+    scratch whenever the Orchestrator replans after a stall."""
+
+    facts: str
+    plan: str
+
+
+class GriceanLogEntry(TypedDict, total=False):
+    """One row of Gricean_history. Written once, by Gricean_Checker, for
+    every message that ever enters MessageHistory. Never read back into a
+    prompt -- it exists purely for post-hoc inspection/debugging."""
 
     step: int
     message_index: int
@@ -34,17 +45,17 @@ class AdherenceLogEntry(TypedDict, total=False):
 
 class ReflectionLogEntry(TypedDict, total=False):
     """One row of the reflection audit trail. A reflection is generated
-    once, used once (folded into the single upcoming call for whichever
-    node is about to consume the flagged message, via
+    once by Gricean_Checker, used once (folded into the single upcoming
+    call of whichever agent is about to receive the flagged message, via
     `state["pending_reflection"]`), and afterwards only kept here for
-    audit purposes. No node ever reads an old entry from this list back
-    into a prompt, so a reflection never resurfaces on a later turn, and
-    one agent's reflection is never visible to another agent."""
+    audit. No agent ever reads an old entry back into a prompt, so a
+    reflection never resurfaces on a later turn, and one agent's
+    reflection is never visible to another agent."""
 
     step: int
     message_index: int
-    consuming_node: str  # which node's very next call this reflection was generated for
-    reason: str  # the adherence checker's reasoning that triggered this reflection
+    receiving_agent: str  # which agent's very next call this reflection was generated for
+    reason: str  # Gricean_Checker's reasoning that triggered this reflection
     reflection: str
 
 
@@ -79,10 +90,8 @@ class MagenticState(TypedDict, total=False):
     team_description: str
     participant_names: List[str]
 
-    facts: str
-    plan: str
-
-    messages: List[ThreadMessage]
+    task_ledger: TaskLedger
+    messages: List[ThreadMessage]  # MessageHistory
 
     n_rounds: int
     n_stalls: int
@@ -98,24 +107,25 @@ class MagenticState(TypedDict, total=False):
     termination_reason: Optional[str]
 
     # --- Gricean adherence + reflection extension ---
-    # Whether the checker/reflection loop runs at all this run. One
-    # compiled graph serves both the "baseline" and "checked" behaviour --
-    # see gricean_check_node in orchestrator_nodes.py -- so this is a
-    # per-run flag on the state, not a build-time graph choice.
+    # Gricean_Checker scores every message regardless of this flag, so
+    # `gricean_history` is populated the same way whether it's on or off
+    # -- directly comparable across a baseline and a checked run. This
+    # flag gates ONLY whether a not_high score ever turns into a
+    # reflection that reaches an agent (`pending_reflection` stays None
+    # whenever it's False, no matter the score). See gricean_checker.py.
     enable_gricean_check: bool
-    # Always describes the *last* message in `messages` as of the most
-    # recent gricean_check_node run.
+    # Always describes the *last* message in `messages`, as of the most
+    # recent Gricean_Checker run.
     adherence_level: str  # "high" | "not_high"
     adherence_reason: str
     adherence_scores: Dict[str, Any]
-    adherence_history: List[AdherenceLogEntry]
-    # Set by gricean_check_node, consumed (and effectively cleared, since
-    # the next gricean_check_node run always overwrites it) by whichever
-    # node runs immediately after. None whenever the last message cleared
-    # HIGH adherence, so that node behaves exactly as if no check existed.
+    gricean_history: List[GriceanLogEntry]
+    # Set by Gricean_Checker, consumed by whichever agent runs immediately
+    # after it. None whenever the last message cleared HIGH adherence, so
+    # that agent behaves exactly as if no checker existed.
     pending_reflection: Optional[str]
     reflection_history: List[ReflectionLogEntry]
-    # gricean_check_node sits on two edges (worker -> progress_ledger, and
-    # progress_ledger -> call_agent) and needs to know which one sent it
-    # here so it can route back correctly once it's done.
+    # Gricean_Checker sits on every edge (worker -> Orchestrator, and
+    # Orchestrator -> worker) and needs to know who should receive the
+    # message it just checked, so it can route there once it's done.
     next_after_check: str
