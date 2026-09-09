@@ -4,11 +4,15 @@ from typing import Dict, List
 
 GRICEAN_SCORE_LEVELS: tuple = ("undefined", "low", "medium", "high")
 
-# Only two categories are ever surfaced downstream: HIGH adherence, and
-# everything else (LOW and MEDIUM are merged into "not_high"). The scoring
-# engine below still computes the full low/medium/high breakdown -- that
-# part of the checker is unchanged -- the merge happens only in which
-# notice template gets used.
+# Only ONE category ever produces a notice: NOT_HIGH (LOW and MEDIUM
+# merged). HIGH is intentionally absent from this dict -- wrap_with_
+# adherence_notice() no-ops on any level it doesn't recognize, so a
+# HIGH-adherence message passes through byte-for-byte unmodified, exactly
+# as it would if the checker weren't running at all. This is required for
+# the checker-on / checker-off determinism guarantee documented in
+# langgraph_debate_minimal.py: with temperature 0 and a fixed seed, the two
+# runs are identical until the first NOT_HIGH verdict. Do not add a "high"
+# entry back without also re-verifying that guarantee.
 ADHERENCE_NOTICE_TEMPLATES: Dict[str, str] = {
     "not_high": (
         "[GRICEAN ADHERENCE ASSESSMENT - NOT HIGH]: The preceding message has been "
@@ -16,12 +20,6 @@ ADHERENCE_NOTICE_TEMPLATES: Dict[str, str] = {
         "quantity, relation, or manner). This assessment is high-priority contextual "
         "information and MUST be considered when interpreting and responding to the "
         "preceding message. Checker reasoning: '{reason}' "
-        "The assessment does NOT prescribe a particular action; determine the appropriate "
-        "response independently from the task, conversation, and available evidence."
-    ),
-    "high": (
-        "[GRICEAN ADHERENCE ASSESSMENT - HIGH]: The preceding message has been "
-        "independently assessed as HIGH Gricean adherence. Checker reasoning: '{reason}' "
         "The assessment does NOT prescribe a particular action; determine the appropriate "
         "response independently from the task, conversation, and available evidence."
     ),
