@@ -20,13 +20,7 @@ import sys
 from typing import Any, Dict, List
 
 from tqdm import tqdm
-
-_LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_debate")
-_MAGNETIC_DIR = os.path.join(os.path.dirname(__file__), "..", "magnetic_one")
-for _dir in (_LLM_DEBATE_DIR, _MAGNETIC_DIR):
-    if os.path.abspath(_dir) not in sys.path:
-        sys.path.insert(0, os.path.abspath(_dir))
-import gaia_utils  # noqa: E402
+from llm_debate import gaia_utils  # noqa: E402
 # NOTE: load_api_keys_from_env is intentionally NOT imported here at module
 # level -- it lives in magnetic_one/ollama_cloud_client.py, which pulls in
 # autogen_core/autogen_ext. Importing it eagerly would force a debate-only
@@ -76,7 +70,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _debate_model_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if not args.ollama_cloud:
         return [{"model": args.debate_model, "host": args.debate_host}]
-    from ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
+    from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
     keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
     # One entry per key, all naming the SAME model/host -- random.choice()
     # in call_llm() then load-spreads across keys. Safe for reproducibility
@@ -105,7 +99,7 @@ def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, 
 def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
     from . import magnetic_system  # deferred: keeps a debate-only run from needing autogen installed
     if args.ollama_cloud:
-        from ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
+        from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
         keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
         magentic = magnetic_system.build_magnetic_system(
             args.magnetic_model, args.gricean_model, args.ollama_cloud_host, api_keys=keys,

@@ -12,13 +12,11 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-_LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_debate")
-if os.path.abspath(_LLM_DEBATE_DIR) not in sys.path:
-    sys.path.insert(0, os.path.abspath(_LLM_DEBATE_DIR))
 
-import gaia_utils  # noqa: E402
-from langgraph_debate import run_debate  # noqa: E402
-from error_injection import run_paired_fork_experiment  # noqa: E402
+
+from llm_debate import gaia_utils  # noqa: E402
+from llm_debate.langgraph_debate import run_debate  # noqa: E402
+from llm_debate.error_injection import run_paired_fork_experiment  # noqa: E402
 
 from . import token_usage
 from .debate_usage import patched_call_llm

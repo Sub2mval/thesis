@@ -29,15 +29,11 @@ import random
 import sys
 from typing import Any, Dict, List
 
-_LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_debate")
-if os.path.abspath(_LLM_DEBATE_DIR) not in sys.path:
-    sys.path.insert(0, os.path.abspath(_LLM_DEBATE_DIR))
-
 import ollama  # noqa: E402
 from tenacity import retry, stop_after_attempt, wait_exponential  # noqa: E402
 
-import langgraph_debate  # noqa: E402
-import error_injection as debate_error_injection  # noqa: E402
+from llm_debate import langgraph_debate  # noqa: E402
+from llm_debate import error_injection as debate_error_injection  # noqa: E402
 
 Message = Dict[str, Any]
 

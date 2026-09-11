@@ -27,10 +27,8 @@ import os
 import sys
 from typing import List, Optional, Tuple
 
-_LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_debate")
-if os.path.abspath(_LLM_DEBATE_DIR) not in sys.path:
-    sys.path.insert(0, os.path.abspath(_LLM_DEBATE_DIR))
-from error_injection import ERROR_TYPES, FAILURE_MODES  # noqa: E402
+
+from llm_debate.error_injection import ERROR_TYPES, FAILURE_MODES  # noqa: E402
 
 
 def _family_of(fm_id: str) -> str:

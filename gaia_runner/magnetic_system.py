@@ -14,19 +14,14 @@ import random
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-_LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_debate")
-_MAGNETIC_DIR = os.path.join(os.path.dirname(__file__), "..", "magnetic_one")
-for _dir in (_LLM_DEBATE_DIR, _MAGNETIC_DIR):
-    if os.path.abspath(_dir) not in sys.path:
-        sys.path.insert(0, os.path.abspath(_dir))
 
-import gaia_utils  # noqa: E402
-from magnetic_one_langgraph import MagenticOneLangGraph  # noqa: E402
-from prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT  # noqa: E402
-from context_utils import ORCHESTRATOR_NAME  # noqa: E402
-from ollama_client import get_usage_tracking, reset_usage_tracking  # noqa: E402
-from paired_fork import fork_paired_traces_with_error, run_paired_traces, shared_prefix_length  # noqa: E402
-from mo_error_injection import list_message_checkpoints  # noqa: E402
+from llm_debate import gaia_utils  # noqa: E402
+from magnetic_one.magnetic_one_langgraph import MagenticOneLangGraph  # noqa: E402
+from magnetic_one.prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT  # noqa: E402
+from magnetic_one.context_utils import ORCHESTRATOR_NAME  # noqa: E402
+from magnetic_one.ollama_client import get_usage_tracking, reset_usage_tracking  # noqa: E402
+from magnetic_one.paired_fork import fork_paired_traces_with_error, run_paired_traces, shared_prefix_length  # noqa: E402
+from magnetic_one.error_injection import list_message_checkpoints  # noqa: E402
 
 from . import token_usage
 
