@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,7 +25,8 @@ from magnetic_one_langgraph import MagenticOneLangGraph  # noqa: E402
 from prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT  # noqa: E402
 from context_utils import ORCHESTRATOR_NAME  # noqa: E402
 from ollama_client import get_usage_tracking, reset_usage_tracking  # noqa: E402
-from paired_fork import fork_paired_traces_with_error, run_paired_traces  # noqa: E402
+from paired_fork import fork_paired_traces_with_error, run_paired_traces, shared_prefix_length  # noqa: E402
+from mo_error_injection import list_message_checkpoints  # noqa: E402
 
 from . import token_usage
 
@@ -34,7 +36,17 @@ from . import token_usage
 GAIA_FINAL_ANSWER_PROMPT = ORCHESTRATOR_FINAL_ANSWER_PROMPT + "\n" + gaia_utils.GAIA_ANSWER_FORMAT_INSTRUCTION
 
 
-def build_magnetic_system(model: str, gricean_model: Optional[str], host: str, **kwargs: Any) -> MagenticOneLangGraph:
+def build_magnetic_system(
+    model: str, gricean_model: Optional[str], host: str,
+    api_keys: Optional[List[str]] = None, **kwargs: Any,
+) -> MagenticOneLangGraph:
+    """Pass `api_keys` (e.g. loaded from OLLAMA_API_KEY_1..N) to route through
+    Ollama Cloud with key rotation instead of a single local/cloud client."""
+    if api_keys:
+        return MagenticOneLangGraph.from_ollama_cloud(
+            model=model, api_keys=api_keys, host=host, gricean_model=gricean_model,
+            final_answer_prompt=GAIA_FINAL_ANSWER_PROMPT, **kwargs,
+        )
     return MagenticOneLangGraph.from_ollama(
         model=model, host=host, gricean_model=gricean_model,
         final_answer_prompt=GAIA_FINAL_ANSWER_PROMPT, **kwargs,
@@ -112,4 +124,67 @@ def run_magnetic_error_forks(
                 "error_type": fork["error_type"], "fm_id": fork["fm_id"], "fm_name": fork["fm_name"],
                 "final_answer": answer, **_score(question, answer), "token_stats": stats,
             })
+    return results
+
+
+def run_magnetic_error_forks_by_source(
+    question: Dict[str, Any],
+    magentic: MagenticOneLangGraph,
+    sources: List[str],
+    error_type: str,
+    fm_id: Optional[str] = None,
+    seed: int = 42,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Like run_magnetic_error_forks, but instead of one fork at a single
+    shared-prefix position (picked by `strategy`), runs one SEPARATE fork
+    per entry in `sources` (e.g. ["MagenticOneOrchestrator", "FileSurfer",
+    "WebSurfer", "Coder"]) -- each targeting a message chosen at random
+    (seeded, so reproducible) from among that specific agent's messages
+    within the shared baseline/Gricean prefix. All forks branch off the
+    SAME baseline pair (one paired run per question, not per source), so
+    every source's injection point is guaranteed to sit in a region that
+    is byte-identical between checker-off and checker-on up to that point.
+
+    Returns {source: [checker_off_row, checker_on_row]}; a source with no
+    matching message in the shared prefix for this question maps to [].
+    """
+    task = _task_text(question)
+    pair = asyncio.run(run_paired_traces(magentic, task, thread_id_prefix=question["task_id"]))
+
+    async def _final_messages():
+        baseline_cps = await list_message_checkpoints(magentic.graph, pair["baseline_config"])
+        gricean_cps = await list_message_checkpoints(magentic.graph, pair["gricean_config"])
+        return baseline_cps[-1]["snapshot"].values["messages"], gricean_cps[-1]["snapshot"].values["messages"]
+
+    baseline_messages, gricean_messages = asyncio.run(_final_messages())
+    shared_len = shared_prefix_length(baseline_messages, gricean_messages)
+
+    rng = random.Random(seed)
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    for source in sources:
+        candidates = [i for i in range(shared_len) if baseline_messages[i]["source"] == source]
+        if not candidates:
+            results[source] = []
+            continue
+        idx = rng.choice(candidates)
+
+        reset_usage_tracking(magentic.client)
+        if magentic.gricean_model_client is not magentic.client:
+            reset_usage_tracking(magentic.gricean_model_client)
+
+        fork = asyncio.run(fork_paired_traces_with_error(
+            magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
+            error_type, ORCHESTRATOR_NAME, fm_id=fm_id, target_message_index=idx,
+        ))
+        stats = token_usage.from_magnetic_token_stats(_combined_usage(magentic))
+        rows = []
+        for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
+            answer = fork[side]["final_state"].get("final_answer") or ""
+            rows.append({
+                "task_id": question["task_id"], "system": "magnetic_one", "fork_condition": label,
+                "target_source": source, "injected_at_message_index": idx,
+                "error_type": fork["error_type"], "fm_id": fork["fm_id"], "fm_name": fork["fm_name"],
+                "final_answer": answer, **_score(question, answer), "token_stats": stats,
+            })
+        results[source] = rows
     return results

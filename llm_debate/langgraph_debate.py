@@ -69,11 +69,23 @@ Message = Dict[str, Any]  # role/content, plus optionally images/audio for attac
 # draws WILL shift which entry later debate turns land on between
 # checker-off and checker-on runs, breaking bit-for-bit reproducibility of
 # *which model handles which turn* even at temperature 0 + a fixed seed.
-# For a strict determinism guarantee, use a single-entry model_list.
+# For a strict determinism guarantee, use a single-entry model_list --
+# UNLESS every entry names the identical model and differs only in
+# `api_key`/`host` (e.g. several Ollama Cloud keys load-balancing the same
+# model): in that case which entry gets picked has no effect on the
+# response itself (same weights, same temperature=0, same seed), only on
+# which key pays for the call, so multi-entry rotation is safe there.
+#
+# `model` entries may optionally carry an `api_key` (e.g. one of several
+# Ollama Cloud keys) -- forwarded as a Bearer Authorization header on a
+# per-call basis, so N keys in model_list gives free random load-spreading
+# across them via the random.choice() above. Falls back to whatever
+# OLLAMA_API_KEY env var is set (or no auth) when `api_key` is absent.
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def call_llm(messages: List[Message], config: Dict[str, Any]) -> str:
     model = random.choice(config["model_list"])
-    client = ollama.Client(host=model.get("host", "http://localhost:11434"))
+    headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
+    client = ollama.Client(host=model.get("host", "http://localhost:11434"), headers=headers)
     options = {k: v for k, v in (("temperature", config.get("temperature")),
                                   ("num_predict", config.get("max_tokens")),
                                   ("seed", config.get("seed"))) if v is not None}

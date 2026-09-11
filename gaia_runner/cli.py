@@ -22,13 +22,23 @@ from typing import Any, Dict, List
 from tqdm import tqdm
 
 _LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_debate")
-if os.path.abspath(_LLM_DEBATE_DIR) not in sys.path:
-    sys.path.insert(0, os.path.abspath(_LLM_DEBATE_DIR))
+_MAGNETIC_DIR = os.path.join(os.path.dirname(__file__), "..", "magnetic_one")
+for _dir in (_LLM_DEBATE_DIR, _MAGNETIC_DIR):
+    if os.path.abspath(_dir) not in sys.path:
+        sys.path.insert(0, os.path.abspath(_dir))
 import gaia_utils  # noqa: E402
+# NOTE: load_api_keys_from_env is intentionally NOT imported here at module
+# level -- it lives in magnetic_one/ollama_cloud_client.py, which pulls in
+# autogen_core/autogen_ext. Importing it eagerly would force a debate-only
+# run to have autogen installed, breaking the same deferred-import
+# separation _run_debate()/_run_magnetic() already rely on below. It's
+# imported lazily, inside _debate_model_list() and _run_magnetic(), instead.
 
 from .error_spec import resolve_error_plan
 from .question_select import select_questions
 from . import trace_io
+
+DEFAULT_OLLAMA_CLOUD_HOST = "https://ollama.com"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -54,12 +64,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--magnetic-model", default="llama3.1:8b")
     p.add_argument("--magnetic-host", default="http://localhost:11434")
     p.add_argument("--gricean-model", default=None, help="Optional separate (cheaper) model for the Gricean checker.")
+    p.add_argument("--ollama-cloud", action="store_true",
+                    help="Use Ollama Cloud instead of a local server: loads all OLLAMA_API_KEY_1.."
+                         "OLLAMA_API_KEY_N (and a bare OLLAMA_API_KEY, if set) from the environment "
+                         "and rotates across them for both systems. Overrides --debate-host/--magnetic-host "
+                         "with --ollama-cloud-host.")
+    p.add_argument("--ollama-cloud-host", default=DEFAULT_OLLAMA_CLOUD_HOST)
     return p
+
+
+def _debate_model_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    if not args.ollama_cloud:
+        return [{"model": args.debate_model, "host": args.debate_host}]
+    from ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
+    keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
+    # One entry per key, all naming the SAME model/host -- random.choice()
+    # in call_llm() then load-spreads across keys. Safe for reproducibility
+    # here because every entry is the identical model; only the auth key
+    # differs (see the determinism note in langgraph_debate.call_llm).
+    return [{"model": args.debate_model, "host": args.ollama_cloud_host, "api_key": k} for k in keys]
 
 
 def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
     from . import debate_system  # deferred: keeps a magnetic-only run from needing ollama/tenacity installed
-    cfg = {"model_list": [{"model": args.debate_model, "host": args.debate_host}], "temperature": 0, "seed": args.seed}
+    cfg = {"model_list": _debate_model_list(args), "temperature": 0, "seed": args.seed}
     rows: List[Dict[str, Any]] = []
     for use_check in (False, True):
         trace = debate_system.run_debate_baseline(question, cfg, use_check, args.agents_num, args.rounds_num)
@@ -76,7 +104,14 @@ def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, 
 
 def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
     from . import magnetic_system  # deferred: keeps a debate-only run from needing autogen installed
-    magentic = magnetic_system.build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
+    if args.ollama_cloud:
+        from ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
+        keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
+        magentic = magnetic_system.build_magnetic_system(
+            args.magnetic_model, args.gricean_model, args.ollama_cloud_host, api_keys=keys,
+        )
+    else:
+        magentic = magnetic_system.build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
     rows: List[Dict[str, Any]] = []
     for use_check in (False, True):
         trace = magnetic_system.run_magnetic_baseline(question, magentic, use_check)

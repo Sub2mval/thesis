@@ -21,6 +21,7 @@ from autogen_ext.code_executors import create_default_code_executor
 
 from context_utils import make_autogen_agent_caller
 from ollama_client import build_ollama_client, get_usage_tracking, reset_usage_tracking
+from ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, RotatingKeyOllamaClient
 from orchestrator_graph import build_magentic_one_graph
 from prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
 
@@ -99,6 +100,30 @@ class MagenticOneLangGraph:
     ) -> "MagenticOneLangGraph":
         client = build_ollama_client(model=model, host=host, model_info=model_info)
         gricean_client = build_ollama_client(model=gricean_model, host=host) if gricean_model else None
+        return cls(client=client, gricean_model_client=gricean_client, **kwargs)
+
+    @classmethod
+    def from_ollama_cloud(
+        cls,
+        model: str,
+        api_keys: list,
+        host: str = DEFAULT_OLLAMA_CLOUD_HOST,
+        gricean_model: Optional[str] = None,
+        model_info: Optional[dict] = None,
+        **kwargs,
+    ) -> "MagenticOneLangGraph":
+        """Same as from_ollama(), but backed by RotatingKeyOllamaClient so
+        every call to the main model (and, if given, a separate cheaper
+        gricean_model) rotates across `api_keys` on Ollama Cloud instead of
+        hitting a single local server under one key. See
+        ollama_cloud_client.py's module docstring for why per-instance
+        Authorization headers have to be done this way (autogen_ext's
+        Ollama client silently drops a `headers=` kwarg)."""
+        client = RotatingKeyOllamaClient(model=model, api_keys=api_keys, host=host, model_info=model_info)
+        gricean_client = (
+            RotatingKeyOllamaClient(model=gricean_model, api_keys=api_keys, host=host)
+            if gricean_model else None
+        )
         return cls(client=client, gricean_model_client=gricean_client, **kwargs)
 
     def _validate_client_capabilities(self, client: ChatCompletionClient) -> None:
