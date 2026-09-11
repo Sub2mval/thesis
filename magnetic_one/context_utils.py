@@ -19,7 +19,7 @@ from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
 from autogen_core.models import AssistantMessage, ChatCompletionClient, LLMMessage, UserMessage
 
-from state import ThreadMessage
+from magnetic_one.state import ThreadMessage
 
 ORCHESTRATOR_NAME = "MagenticOneOrchestrator"
 

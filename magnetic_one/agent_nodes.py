@@ -12,11 +12,11 @@ from typing import Any, Dict
 
 from autogen_core.models import ChatCompletionClient
 
-from context_utils import AgentCaller, ORCHESTRATOR_NAME
-from gricean_check import GRICEAN_CHECKER_NAME
-from gricean_checker import build_gricean_checker_node
-from orchestrator_agent import build_orchestrator_node
-from worker_agent import build_worker_nodes
+from magnetic_one.context_utils import AgentCaller, ORCHESTRATOR_NAME
+from magnetic_one.gricean_check import GRICEAN_CHECKER_NAME
+from magnetic_one.gricean_checker import build_gricean_checker_node
+from magnetic_one.orchestrator_agent import build_orchestrator_node
+from magnetic_one.worker_agent import build_worker_nodes
 
 
 def build_agent_nodes(

@@ -29,11 +29,11 @@ from typing import Any, Dict, List, Optional
 
 from autogen_core.models import ChatCompletionClient
 
-from error_injection import generate_corrupted_message, list_message_checkpoints
-from state import ThreadMessage
+from magnetic_one.error_injection import generate_corrupted_message, list_message_checkpoints
+from magnetic_one.state import ThreadMessage
 
 try:  # only needed for the type hint; avoids a hard import cycle at runtime
-    from magentic_one_langgraph import MagenticOneLangGraph
+    from magnetic_one.magnetic_one_langgraph import MagenticOneLangGraph
 except ImportError:  # pragma: no cover
     MagenticOneLangGraph = Any  # type: ignore
 

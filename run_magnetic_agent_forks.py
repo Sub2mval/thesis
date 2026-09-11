@@ -37,14 +37,10 @@ import os
 import sys
 from typing import Any, Dict, List
 
-_LLM_DEBATE_DIR = os.path.join(os.path.dirname(__file__), "llm_debate")
-_MAGNETIC_DIR = os.path.join(os.path.dirname(__file__), "magnetic_one")
-for _dir in (_LLM_DEBATE_DIR, _MAGNETIC_DIR):
-    if os.path.abspath(_dir) not in sys.path:
-        sys.path.insert(0, os.path.abspath(_dir))
+from dotenv import load_dotenv
 
-import gaia_utils  # noqa: E402
-from ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, load_api_keys_from_env  # noqa: E402
+from llm_debate import gaia_utils  # noqa: E402
+from magnetic_one.ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, load_api_keys_from_env  # noqa: E402
 
 from gaia_runner.error_spec import resolve_error_plan  # noqa: E402
 from gaia_runner.question_select import select_questions  # noqa: E402
@@ -64,9 +60,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", default="gaia_runs/output/magnetic_one")
     p.add_argument("--gaia-source", choices=["huggingface", "local"], default="huggingface")
     p.add_argument("--gaia-local-path", default=None)
-    p.add_argument("--gaia-subset", default="2023_level1")
+    p.add_argument("--gaia-subset", default="2023_all")
     p.add_argument("--gaia-split", default="validation")
-    p.add_argument("--magnetic-model", default="llama3.1:8b")
+    p.add_argument("--magnetic-model", default="gemma4:31b-cloud")
     p.add_argument("--magnetic-host", default="http://localhost:11434")
     p.add_argument("--gricean-model", default=None)
     p.add_argument("--ollama-cloud", action="store_true",
@@ -96,6 +92,7 @@ def _save_source_rows(out_dir: str, task_id: str, source: str, rows: List[Dict[s
 
 
 def main(argv: List[str] = None) -> None:
+    load_dotenv()
     args = build_arg_parser().parse_args(argv)
     task_ids = [t.strip() for t in args.task_ids.split(",") if t.strip()]
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]

@@ -40,11 +40,11 @@ from autogen_core.models import ChatCompletionClient
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
-from agent_nodes import build_agent_nodes
-from context_utils import AgentCaller, ORCHESTRATOR_NAME
-from gricean_check import GRICEAN_CHECKER_NAME
-from prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
-from state import MagenticState
+from magnetic_one.agent_nodes import build_agent_nodes
+from magnetic_one.context_utils import AgentCaller, ORCHESTRATOR_NAME
+from magnetic_one.gricean_check import GRICEAN_CHECKER_NAME
+from magnetic_one.prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
+from magnetic_one.state import MagenticState
 
 
 def build_magentic_one_graph(

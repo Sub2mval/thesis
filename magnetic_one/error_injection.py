@@ -19,9 +19,9 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from autogen_core.models import ChatCompletionClient, UserMessage
 
-from context_utils import ORCHESTRATOR_NAME
-from failure_modes import ERROR_TYPES, choose_failure_mode
-from state import ThreadMessage
+from magnetic_one.context_utils import ORCHESTRATOR_NAME
+from magnetic_one.failure_modes import ERROR_TYPES, choose_failure_mode
+from magnetic_one.state import ThreadMessage
 
 _CORRUPTION_PROMPT = """CRITICAL RESPONSE CORRUPTION TASK - MUST SUCCEED
 

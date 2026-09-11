@@ -14,9 +14,9 @@ from typing import Any, Dict
 
 from autogen_core import CancellationToken
 
-from context_utils import ORCHESTRATOR_NAME, AgentCaller
-from json_llm import truncate_message_content
-from state import MagenticState
+from magnetic_one.context_utils import ORCHESTRATOR_NAME, AgentCaller
+from magnetic_one.json_llm import truncate_message_content
+from magnetic_one.state import MagenticState
 
 
 def build_worker_nodes(agent_callers: Dict[str, AgentCaller]) -> Dict[str, Any]:

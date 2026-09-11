@@ -13,10 +13,8 @@ Usage (run from the thesis-main/ directory):
 """
 
 from __future__ import annotations
-
+from dotenv import load_dotenv
 import argparse
-import os
-import sys
 from typing import Any, Dict, List
 
 from tqdm import tqdm
@@ -49,13 +47,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", default="gaia_runs/output")
     p.add_argument("--gaia-source", choices=["huggingface", "local"], default="huggingface")
     p.add_argument("--gaia-local-path", default=None)
-    p.add_argument("--gaia-subset", default="2023_level1")
+    p.add_argument("--gaia-subset", default="2023_all")
     p.add_argument("--gaia-split", default="validation")
-    p.add_argument("--debate-model", default="llama3.1:8b")
+    p.add_argument("--debate-model", default="gemma4:31b-cloud")
     p.add_argument("--debate-host", default="http://localhost:11434")
     p.add_argument("--agents-num", type=int, default=3)
     p.add_argument("--rounds-num", type=int, default=2)
-    p.add_argument("--magnetic-model", default="llama3.1:8b")
+    p.add_argument("--magnetic-model", default="gemma4:31b-cloud")
     p.add_argument("--magnetic-host", default="http://localhost:11434")
     p.add_argument("--gricean-model", default=None, help="Optional separate (cheaper) model for the Gricean checker.")
     p.add_argument("--ollama-cloud", action="store_true",
@@ -121,6 +119,7 @@ def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan
 
 
 def main(argv: List[str] = None) -> None:
+    from dotenv import load_dotenv
     args = build_arg_parser().parse_args(argv)
     task_ids = args.task_ids.split(",") if args.task_ids else None
     error_plan = resolve_error_plan(family=args.error_family, fm_id=args.error_type)

@@ -48,7 +48,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from langgraph.graph import END, START, StateGraph
 
-from Gricean_check import (
+from .Gricean_check import (
     GRICEAN_METRICS,
     format_combined_reason,
     format_conversation,

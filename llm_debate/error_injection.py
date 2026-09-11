@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
 
-from langgraph_debate import Message, build_graph, call_llm
+from .langgraph_debate import Message, build_graph, call_llm
 
 
 class FailureMode(TypedDict):

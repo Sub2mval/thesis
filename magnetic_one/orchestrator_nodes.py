@@ -21,9 +21,9 @@ from typing import Any, Dict
 
 from autogen_core.models import ChatCompletionClient
 
-from context_utils import AgentCaller
-from dispatch_nodes import build_dispatch_nodes
-from ledger_nodes import build_ledger_nodes
+from magnetic_one.context_utils import AgentCaller
+from magnetic_one.dispatch_nodes import build_dispatch_nodes
+from magnetic_one.ledger_nodes import build_ledger_nodes
 
 
 def build_orchestrator_nodes(

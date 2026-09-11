@@ -19,11 +19,11 @@ from autogen_ext.agents.magentic_one import MagenticOneCoderAgent
 from autogen_ext.agents.web_surfer import MultimodalWebSurfer
 from autogen_ext.code_executors import create_default_code_executor
 
-from context_utils import make_autogen_agent_caller
-from ollama_client import build_ollama_client, get_usage_tracking, reset_usage_tracking
-from ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, RotatingKeyOllamaClient
-from orchestrator_graph import build_magentic_one_graph
-from prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
+from magnetic_one.context_utils import make_autogen_agent_caller
+from magnetic_one.ollama_client import build_ollama_client, get_usage_tracking, reset_usage_tracking
+from magnetic_one.ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, RotatingKeyOllamaClient
+from magnetic_one.orchestrator_graph import build_magentic_one_graph
+from magnetic_one.prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
 
 SyncInputFunc = Callable[[str], str]
 AsyncInputFunc = Callable[[str, Optional[CancellationToken]], Awaitable[str]]

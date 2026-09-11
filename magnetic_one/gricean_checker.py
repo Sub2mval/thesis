@@ -37,8 +37,8 @@ from typing import Optional
 
 from autogen_core.models import ChatCompletionClient, UserMessage
 
-from context_utils import get_compatible_context
-from gricean_check import (
+from magnetic_one.context_utils import get_compatible_context
+from magnetic_one.gricean_check import (
     GRICEAN_CHECKER_NAME,
     GRICEAN_METRICS,
     SCORE_MAX,
@@ -49,8 +49,8 @@ from gricean_check import (
     format_reflection_prompt,
     score_to_adherence_level,
 )
-from json_llm import call_model_for_json
-from state import MagenticState
+from magnetic_one.json_llm import call_model_for_json
+from magnetic_one.state import MagenticState
 
 logger = logging.getLogger("magentic_one_langgraph.gricean_checker")
 

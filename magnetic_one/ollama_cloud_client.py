@@ -35,7 +35,7 @@ from ollama import ResponseError
 from autogen_core import CancellationToken
 from autogen_core.models import ChatCompletionClient, CreateResult, LLMMessage
 
-from ollama_client import InstrumentedOllamaChatCompletionClient, get_usage_tracking as _get_local_usage
+from magnetic_one.ollama_client import InstrumentedOllamaChatCompletionClient, get_usage_tracking as _get_local_usage
 from autogen_core.tools import Tool, ToolSchema
 from pydantic import BaseModel
 

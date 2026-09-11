@@ -12,9 +12,9 @@ from typing import Any, Dict
 
 from autogen_core.models import ChatCompletionClient, UserMessage
 
-from context_utils import ORCHESTRATOR_NAME, build_llm_context, get_compatible_context, team_description
-from json_llm import call_model_for_json
-from prompts import (
+from magnetic_one.context_utils import ORCHESTRATOR_NAME, build_llm_context, get_compatible_context, team_description
+from magnetic_one.json_llm import call_model_for_json
+from magnetic_one.prompts import (
     ORCHESTRATOR_PROGRESS_LEDGER_PROMPT,
     ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT,
     ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT,
@@ -22,7 +22,7 @@ from prompts import (
     ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT,
     ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 )
-from state import MagenticState
+from magnetic_one.state import MagenticState
 
 
 def build_ledger_nodes(

@@ -311,7 +311,7 @@ def load_attachment(
 
 def load_gaia_questions(
     source: str = "huggingface",
-    subset: str = "2023_level1",
+    subset: str = "2023_all",
     split: str = "validation",
     local_path: Optional[str] = None,
     text_only: bool = False,
@@ -350,7 +350,20 @@ def load_gaia_questions(
                 "The 'datasets' package is required to load GAIA from Hugging "
                 "Face. Install with: pip install datasets"
             ) from e
-        ds = load_dataset("gaia-benchmark/GAIA", subset, split=split)
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        try:
+            ds = load_dataset("gaia-benchmark/GAIA", subset, split=split, token=hf_token)
+        except Exception as e:
+            hint = (
+                "Could not load 'gaia-benchmark/GAIA' from the Hub. This dataset is gated: "
+                "(1) log into huggingface.co with the account HF_TOKEN belongs to, open "
+                "https://huggingface.co/datasets/gaia-benchmark/GAIA and click 'Agree and access "
+                "repository' -- a token alone does not grant access until that's done; "
+                "(2) make sure HF_TOKEN is actually set in *this* process (`python -c \"import os; "
+                "print(bool(os.environ.get('HF_TOKEN')))\"`) -- exporting it in a different shell/tab "
+                "won't carry over. Original error below."
+            )
+            raise RuntimeError(f"{hint}\n{e}") from e
         raw = list(ds)
 
     attachment_index = _get_gaia_attachment_index(split) if (use_hub and not text_only) else {}
