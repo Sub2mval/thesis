@@ -15,9 +15,9 @@
 # (checker off) and Gricean-checker-on debates side by side, each under its
 # own checkpointer, and looks for a checkpoint that is BYTE-IDENTICAL in
 # both traces (guaranteed to exist for any prefix before the checker's
-# first NOT_HIGH verdict -- see the sanity-check fix in
-# Gricean_check.py/ADHERENCE_NOTICE_TEMPLATES: the HIGH path is now a true
-# no-op). It generates exactly ONE corruption and forks BOTH runs from that
+# first NOT_HIGH verdict -- a HIGH verdict never triggers a reflection call
+# in agent_turn, so the two runs stay in lockstep until the first NOT_HIGH).
+# It generates exactly ONE corruption and forks BOTH runs from that
 # shared checkpoint with the identical corrupted content, so both
 # continuations start from provably identical message histories and any
 # difference afterward is attributable to the checker, not to the two runs
