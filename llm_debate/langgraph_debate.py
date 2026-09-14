@@ -8,22 +8,24 @@
 # adapted at the call site without touching that module.
 #
 # Adherence handling: only HIGH vs. NOT_HIGH (low+medium merged) is acted
-# on here -- the checker's own low/medium/high engine is untouched, the
-# merge happens where the level is consumed. HIGH behaves exactly as a
-# normal broadcast always has. NOT_HIGH additionally triggers a private
-# reflection call for the receiving agent: the flagged message (still
-# broadcast into permanent context as usual, wrapped in its notice) plus
-# the checker's reasoning become the reflection prompt; the reflection
-# text is used once, to help shape *this turn's* answer, then stored in
-# its own state variable (state["reflections"]) -- never appended to any
-# agent_contexts, never re-shown to its author or anyone else afterward.
+# on here -- the checker's own engine is untouched, the merge happens where
+# the level is consumed. HIGH behaves exactly as a normal broadcast always
+# has. NOT_HIGH additionally triggers a private reflection call for the
+# receiving agent: the flagged message's raw content (delivered to other
+# agents unmodified -- the checker's verdict never alters what is actually
+# broadcast, matching magnetic_one's Gricean_Checker, which never touches
+# MessageHistory either) plus the checker's reasoning become the reflection
+# prompt; the reflection text is used once, to help shape *this turn's*
+# answer, then stored in its own state variable (state["reflections"]) --
+# never appended to any agent_contexts, never re-shown to its author or
+# anyone else afterward.
 #
 # gricean_check itself runs on every turn regardless of use_gricean_check,
 # so adherence history is always collected for analysis. use_gricean_check
 # only controls whether agent_turn actually surfaces that history to the
-# agents (notices in the broadcast, reflection triggering) -- when off,
-# construct_broadcast is handed an empty adherence view, so the debate
-# proceeds exactly as if the checker weren't running at all, while
+# agents (reflection triggering) -- when off, construct_broadcast is handed
+# an empty adherence view, so no reflection is ever triggered and the
+# debate proceeds exactly as if the checker weren't running at all, while
 # state["adherence"] still fills up in the background.
 #
 # Dropped vs. the original long version (plumbing only, not mechanism):
@@ -54,7 +56,6 @@ from .Gricean_check import (
     format_conversation,
     format_gricean_check_prompt,
     score_to_gricean_level,
-    wrap_with_adherence_notice,
 )
 
 Message = Dict[str, Any]  # role/content, plus optionally images/audio for attachments
@@ -106,7 +107,11 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
                          adherence: Dict[int, Dict[str, str]]) -> Tuple[Message, List[Tuple[int, str, str]]]:
     """Returns (broadcast_message, flagged) where flagged lists the
     (agent_id, raw_content, checker_reason) triples for NOT_HIGH sources
-    this round -- used by the caller to decide whether to reflect."""
+    this round -- used by the caller to decide whether to reflect. The
+    delivered content itself is never altered by the checker's verdict
+    (matching magnetic_one's Gricean_Checker, which never touches
+    MessageHistory) -- a flagged message only ever reaches the receiving
+    agent through the private reflection call in agent_turn."""
     if not others:
         return {"role": "user", "content": "Please verify and restate your answer clearly at the end."}, []
     parts = ["Other agents' current answers:"]
@@ -114,8 +119,7 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
     for agent_id, ctx in others:
         content = ctx[round_idx]["content"]
         info = adherence.get(agent_id)
-        text = wrap_with_adherence_notice(content, info["level"], info["reason"]) if info else content
-        parts.append(f"\nAgent {agent_id + 1}: ```{text}```")
+        parts.append(f"\nAgent {agent_id + 1}: ```{content}```")
         if info and info["level"] == "not_high":
             flagged.append((agent_id, content, info["reason"]))
     parts.append(f"\n\nUsing this as advice, give an updated answer to: {question}\n"
@@ -226,8 +230,7 @@ def gricean_check(state: DebateState) -> Dict[str, Any]:
     scores = parse_gricean_scores(call_llm([{"role": "user", "content": prompt}], state["config"]))
     level = score_to_gricean_level({m: scores[m]["score"] for m in GRICEAN_METRICS})
     adherence = dict(state["adherence"])
-    adherence[speaker] = {"level": "high" if level == "high" else "not_high",
-                           "reason": format_combined_reason(scores)}
+    adherence[speaker] = {"level": level, "reason": format_combined_reason(scores)}
     return {"adherence": adherence}
 
 
