@@ -83,7 +83,9 @@ Message = Dict[str, Any]  # role/content, plus optionally images/audio for attac
 # across them via the random.choice() above. Falls back to whatever
 # OLLAMA_API_KEY env var is set (or no auth) when `api_key` is absent.
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
-def call_llm(messages: List[Message], config: Dict[str, Any]) -> str:
+def call_llm(messages: List[Message], config: Dict[str, Any], call_type: str = "unknown") -> str:
+    # call_type is purely a label for instrumentation (see gaia_runner/debate_usage.py) --
+    # it has no effect on model selection or the request itself.
     model = random.choice(config["model_list"])
     headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
     client = ollama.Client(host=model.get("host", "http://localhost:11434"), headers=headers)
@@ -199,7 +201,7 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
     extra: List[Message] = []
     if flagged:
         reflection = call_llm([{"role": "user", "content": _reflection_prompt(state["query"], flagged)}],
-                               state["config"])
+                               state["config"], call_type="reflection")
         # Kept for the record, with the context of what it was responding
         # to (round + the flagged messages/reasons) -- never fed back into
         # any prompt, and accumulated (not overwritten) so a full history
@@ -212,7 +214,7 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         extra = [{"role": "user", "content": f"[Private reflection -- not part of the shared conversation]\n"
                                               f"{reflection}\n\nNow give your updated answer to the task."}]
 
-    reply = call_llm(contexts[i] + extra, state["config"])
+    reply = call_llm(contexts[i] + extra, state["config"], call_type="agent_turn")
     contexts[i].append({"role": "assistant", "content": reply})
     next_i = (i + 1) % state["agents_num"]
     return {"contexts": contexts, "agent_idx": next_i, "round": r + 1 if next_i == 0 else r,
@@ -227,7 +229,7 @@ def gricean_check(state: DebateState) -> Dict[str, Any]:
     ctx = state["contexts"][speaker]
     conversation = format_conversation([{"source": m["role"], "content": m["content"]} for m in ctx])
     prompt = format_gricean_check_prompt(state["query"], conversation, f"Agent {speaker + 1}")
-    scores = parse_gricean_scores(call_llm([{"role": "user", "content": prompt}], state["config"]))
+    scores = parse_gricean_scores(call_llm([{"role": "user", "content": prompt}], state["config"], call_type="gricean_check"))
     level = score_to_gricean_level({m: scores[m]["score"] for m in GRICEAN_METRICS})
     adherence = dict(state["adherence"])
     adherence[speaker] = {"level": level, "reason": format_combined_reason(scores)}
@@ -240,7 +242,7 @@ def aggregate(state: DebateState) -> Dict[str, Any]:
     instruction = state["config"].get("answer_format_instruction")
     if instruction:
         prompt += f"\n\n{instruction}"
-    return {"final_answer": call_llm([{"role": "user", "content": prompt}], state["config"])}
+    return {"final_answer": call_llm([{"role": "user", "content": prompt}], state["config"], call_type="aggregate")}
 
 
 def debate_finished(state: DebateState) -> bool:
@@ -269,7 +271,10 @@ def build_graph(checkpointer=None):
 
 
 def run_debate(query: str, config: Dict[str, Any], agents_num: int = 3, rounds_num: int = 2,
-               use_gricean_check: bool = False, attachment: Optional[Dict[str, Any]] = None) -> str:
+               use_gricean_check: bool = False, attachment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Returns the full final DebateState (contexts/adherence/reflections/
+    final_answer/etc), not just the answer string -- callers that only
+    want the answer should read result["final_answer"]."""
     app = build_graph()
     result = app.invoke(
         {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
@@ -277,13 +282,13 @@ def run_debate(query: str, config: Dict[str, Any], agents_num: int = 3, rounds_n
          "use_gricean_check": use_gricean_check, "attachment": attachment},
         config={"recursion_limit": 300},
     )
-    return result["final_answer"]
+    return result
 
 
 if __name__ == "__main__":
     cfg = {"model_list": [{"model": "llama3.1:8b", "host": "http://localhost:11434"}],
            "temperature": 0.7, "max_tokens": 1024}
     print("--- no adherence check ---")
-    print(run_debate("What is 17 * 24?", cfg))
+    print(run_debate("What is 17 * 24?", cfg)["final_answer"])
     print("--- with adherence check ---")
-    print(run_debate("What is 17 * 24?", cfg, use_gricean_check=True))
+    print(run_debate("What is 17 * 24?", cfg, use_gricean_check=True)["final_answer"])
