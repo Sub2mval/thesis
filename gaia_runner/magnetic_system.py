@@ -1,6 +1,6 @@
 """
 Adapter between the GAIA runner and the magnetic_one MAS
-(magnetic_one_langgraph.py + paired_fork.py + mo_error_injection.py).
+(magnetic_one_langgraph.py + paired_fork.py + error_injection.py).
 Token usage is already tracked inside magnetic_one itself (ollama_client.py);
 this module reshapes it into the common schema from token_usage.py and
 adds GAIA scoring / attachment handling.
@@ -86,6 +86,11 @@ def run_magnetic_baseline(question: Dict[str, Any], magentic: MagenticOneLangGra
         "task_id": question["task_id"], "system": "magnetic_one", "use_gricean_check": use_gricean_check,
         "final_answer": answer, **_score(question, answer),
         "token_stats": token_usage.from_magnetic_token_stats(result["token_stats"]),
+        # Full shared conversation, checker score log, and the one-shot
+        # reflection audit log -- previously discarded here even though
+        # graph.ainvoke() already returns all of it.
+        "messages": result.get("messages"), "gricean_history": result.get("gricean_history"),
+        "reflection_history": result.get("reflection_history"),
     }
 
 
@@ -113,11 +118,18 @@ def run_magnetic_error_forks(
         ))
         stats = token_usage.from_magnetic_token_stats(_combined_usage(magentic))
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
-            answer = fork[side]["final_state"].get("final_answer") or ""
+            side_result = fork[side]
+            final_state = side_result["final_state"]
+            answer = final_state.get("final_answer") or ""
             results.append({
                 "task_id": question["task_id"], "system": "magnetic_one", "fork_condition": label,
                 "error_type": fork["error_type"], "fm_id": fork["fm_id"], "fm_name": fork["fm_name"],
                 "final_answer": answer, **_score(question, answer), "token_stats": stats,
+                "injected_at_message_index": fork["injected_at_message_index"],
+                "injected_at_step": side_result.get("injected_at_step"), "injected_at_node": side_result.get("injected_at_node"),
+                "original_message": side_result.get("original_message"), "corrupted_message": fork["corrupted_message"],
+                "messages": final_state.get("messages"), "gricean_history": final_state.get("gricean_history"),
+                "reflection_history": final_state.get("reflection_history"),
             })
     return results
 
@@ -174,12 +186,18 @@ def run_magnetic_error_forks_by_source(
         stats = token_usage.from_magnetic_token_stats(_combined_usage(magentic))
         rows = []
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
-            answer = fork[side]["final_state"].get("final_answer") or ""
+            side_result = fork[side]
+            final_state = side_result["final_state"]
+            answer = final_state.get("final_answer") or ""
             rows.append({
                 "task_id": question["task_id"], "system": "magnetic_one", "fork_condition": label,
                 "target_source": source, "injected_at_message_index": idx,
                 "error_type": fork["error_type"], "fm_id": fork["fm_id"], "fm_name": fork["fm_name"],
                 "final_answer": answer, **_score(question, answer), "token_stats": stats,
+                "injected_at_step": side_result.get("injected_at_step"), "injected_at_node": side_result.get("injected_at_node"),
+                "original_message": side_result.get("original_message"), "corrupted_message": fork["corrupted_message"],
+                "messages": final_state.get("messages"), "gricean_history": final_state.get("gricean_history"),
+                "reflection_history": final_state.get("reflection_history"),
             })
         results[source] = rows
     return results
