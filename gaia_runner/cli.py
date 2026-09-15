@@ -15,6 +15,7 @@ Usage (run from the thesis-main/ directory):
 from __future__ import annotations
 from dotenv import load_dotenv
 import argparse
+import asyncio
 from typing import Any, Dict, List
 
 from tqdm import tqdm
@@ -94,7 +95,20 @@ def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, 
     return rows
 
 
-def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
+async def _run_magnetic_async(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
+    """Async core for _run_magnetic. Everything against one `magentic`
+    instance -- both baseline calls (checker off/on) and the error forks --
+    runs inside this single coroutine/event loop.
+
+    This matters because `magentic.client` is a long-lived ollama/httpx
+    async client: its connection pool binds to whichever event loop is
+    running the first time a request goes out. Calling `asyncio.run()`
+    separately for each baseline (as the old sync-only version did) tears
+    that loop down after the checker-off call returns, so the checker-on
+    call -- on a brand-new loop -- blows up with `RuntimeError: Event loop
+    is closed` as soon as it touches the stale connection. Keeping every
+    await for this `magentic` instance under one `asyncio.run()` avoids
+    that entirely."""
     from . import magnetic_system  # deferred: keeps a debate-only run from needing autogen installed
     if args.ollama_cloud:
         from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
@@ -106,16 +120,20 @@ def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan
         magentic = magnetic_system.build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
     rows: List[Dict[str, Any]] = []
     for use_check in (False, True):
-        trace = magnetic_system.run_magnetic_baseline(question, magentic, use_check)
+        trace = await magnetic_system.run_magnetic_baseline_async(question, magentic, use_check)
         trace_io.save_baseline_trace(out_dir, trace)
         rows.append(trace_io.summary_row(trace, "baseline"))
-    forks = magnetic_system.run_magnetic_error_forks(question, magentic, error_plan)
+    forks = await magnetic_system.run_magnetic_error_forks_async(question, magentic, error_plan)
     for i, fork_trace in enumerate(forks):
         trace_io.save_fork_trace(out_dir, fork_trace, i)
         rows.append(trace_io.summary_row(fork_trace, "fork"))
     for row in rows:
         trace_io.append_summary_row(out_dir, row)
     return rows
+
+
+def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
+    return asyncio.run(_run_magnetic_async(question, args, error_plan, out_dir))
 
 
 def main(argv: List[str] = None) -> None:
