@@ -299,7 +299,7 @@ def generate_corrupted_message(config: Dict[str, Any], task: str, agent_context:
     conversation = "\n".join(f"[{m['role']}]: {m['content']}" for m in agent_context[:position]) or "(no prior messages)"
     prompt = _CORRUPTION_PROMPT.format(fm_instruction=mode["instruction"], task=task, conversation=conversation,
                                         source="the agent being corrupted", original_content=target["content"])
-    response = call_llm([{"role": "user", "content": prompt}], config)
+    response = call_llm([{"role": "user", "content": prompt}], config, call_type="corruption")
     return {"content": response.strip(), "fm_id": mode["id"], "fm_name": mode["name"]}
 
 
@@ -353,6 +353,7 @@ async def run_all_forks(graph, config: Dict[str, Any], task: str, target: Option
 async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], task: str, error_type: str,
                                       agents_num: int = 3, rounds_num: int = 2, fm_id: Optional[str] = None,
                                       strategy: str = "middle_agent_message",
+                                      attachment: Optional[Dict[str, Any]] = None,
                                       ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Runs the SAME debate twice -- checker off, checker on -- each under
     its own MemorySaver/thread, locates a checkpoint whose (agent_id,
@@ -360,6 +361,22 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     assumed -- see the content equality check below), generates ONE
     corruption there, and forks both graphs from that shared point with
     the identical corrupted content. Returns (result_off, result_on).
+
+    `attachment` (shape of gaia_utils.load_attachment()'s return value) is
+    passed to BOTH graphs via the shared `base` dict below, not loaded or
+    attached separately per side. That's deliberate, not incidental: both
+    graphs run init_agents() -- the same pure function of `query` and
+    `attachment` -- as their very first, identical step, so handing them
+    the same attachment object guarantees the attachment is embedded at
+    the same step (init_agents, before either graph's first agent_turn)
+    and in the same order (all `agents_num` agents get an identical copy,
+    built by the same list comprehension) in both traces. That's exactly
+    what the byte-identical-shared-checkpoint search below depends on: if
+    the two sides ever built their initial message differently -- e.g. one
+    attached and one not -- they would never share a checkpoint at all,
+    and this function would always raise the "no checkpoint is
+    byte-identical" error below. Do not load or construct the attachment
+    separately for graph_off vs. graph_on.
     """
     saver_off, saver_on = MemorySaver(), MemorySaver()
     graph_off, graph_on = build_graph(saver_off), build_graph(saver_on)
@@ -367,7 +384,7 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     cfg_on = {"configurable": {"thread_id": "gricean"}, "recursion_limit": 300}
     base = {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
             "contexts": [], "adherence": {}, "reflections": {}, "final_answer": None, "config": debate_config,
-            "attachment": None}
+            "attachment": attachment}
 
     await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
     await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
