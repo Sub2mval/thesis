@@ -1,6 +1,6 @@
 """
 Adapter between the GAIA runner and the magnetic_one MAS
-(magnetic_one_langgraph.py + paired_fork.py + error_injection.py).
+(magnetic_one_langgraph.py + paired_fork.py + mo_error_injection.py).
 Token usage is already tracked inside magnetic_one itself (ollama_client.py);
 this module reshapes it into the common schema from token_usage.py and
 adds GAIA scoring / attachment handling.
@@ -77,24 +77,38 @@ def _combined_usage(magentic: MagenticOneLangGraph) -> Dict[str, Any]:
     return {"calls": calls}
 
 
-def run_magnetic_baseline(question: Dict[str, Any], magentic: MagenticOneLangGraph, use_gricean_check: bool) -> Dict[str, Any]:
-    """Runs one GAIA question through magnetic_one once (checker on or off)."""
+async def run_magnetic_baseline_async(question: Dict[str, Any], magentic: MagenticOneLangGraph, use_gricean_check: bool) -> Dict[str, Any]:
+    """Runs one GAIA question through magnetic_one once (checker on or off).
+
+    Async core -- call this (awaited, inside a caller-owned event loop) when
+    you're going to make more than one call against the same `magentic`
+    instance. `magentic.client` is a long-lived ollama/httpx async client
+    whose connection pool binds to whichever event loop is running the
+    first time it's used; wrapping *each* call in its own `asyncio.run()`
+    tears that loop down afterward, so a second call against the same
+    client raises `RuntimeError: Event loop is closed`. Keeping all calls
+    for one `magentic` instance inside a single loop avoids that.
+    """
     tid = f"{question['task_id']}-{'on' if use_gricean_check else 'off'}"
-    result = asyncio.run(magentic.run(_task_text(question), thread_id=tid, enable_gricean_check=use_gricean_check))
+    result = await magentic.run(_task_text(question), thread_id=tid, enable_gricean_check=use_gricean_check)
     answer = result.get("final_answer") or ""
     return {
         "task_id": question["task_id"], "system": "magnetic_one", "use_gricean_check": use_gricean_check,
         "final_answer": answer, **_score(question, answer),
         "token_stats": token_usage.from_magnetic_token_stats(result["token_stats"]),
-        # Full shared conversation, checker score log, and the one-shot
-        # reflection audit log -- previously discarded here even though
-        # graph.ainvoke() already returns all of it.
-        "messages": result.get("messages"), "gricean_history": result.get("gricean_history"),
-        "reflection_history": result.get("reflection_history"),
     }
 
 
-def run_magnetic_error_forks(
+def run_magnetic_baseline(question: Dict[str, Any], magentic: MagenticOneLangGraph, use_gricean_check: bool) -> Dict[str, Any]:
+    """Sync wrapper. Only safe when this is the ONLY call you're making
+    against `magentic` -- if you need checker-off AND checker-on (or
+    baseline + forks) against the same instance, use
+    `run_magnetic_baseline_async` inside one shared event loop instead (see
+    gaia_runner.cli._run_magnetic_async)."""
+    return asyncio.run(run_magnetic_baseline_async(question, magentic, use_gricean_check))
+
+
+async def run_magnetic_error_forks_async(
     question: Dict[str, Any],
     magentic: MagenticOneLangGraph,
     error_plan: List[Tuple[str, Optional[str]]],
@@ -104,37 +118,48 @@ def run_magnetic_error_forks(
     in `error_plan`, all forked from that same shared pair (see
     paired_fork.py's docstring for why this stays byte-identical up to
     the injection point). Returns a flat list of two trace dicts
-    (checker_off, checker_on) per fork."""
+    (checker_off, checker_on) per fork.
+
+    Async core -- see the note on `run_magnetic_baseline_async` above:
+    every await here shares whichever event loop the caller is running,
+    so `magentic.client`'s connection pool is never asked to survive a
+    loop teardown between calls."""
     task = _task_text(question)
-    pair = asyncio.run(run_paired_traces(magentic, task, thread_id_prefix=question["task_id"]))
+    pair = await run_paired_traces(magentic, task, thread_id_prefix=question["task_id"])
     results: List[Dict[str, Any]] = []
     for error_type, fm_id in error_plan:
         reset_usage_tracking(magentic.client)
         if magentic.gricean_model_client is not magentic.client:
             reset_usage_tracking(magentic.gricean_model_client)
-        fork = asyncio.run(fork_paired_traces_with_error(
+        fork = await fork_paired_traces_with_error(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
             error_type, ORCHESTRATOR_NAME, fm_id=fm_id, strategy=strategy,
-        ))
+        )
         stats = token_usage.from_magnetic_token_stats(_combined_usage(magentic))
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
-            side_result = fork[side]
-            final_state = side_result["final_state"]
-            answer = final_state.get("final_answer") or ""
+            answer = fork[side]["final_state"].get("final_answer") or ""
             results.append({
                 "task_id": question["task_id"], "system": "magnetic_one", "fork_condition": label,
                 "error_type": fork["error_type"], "fm_id": fork["fm_id"], "fm_name": fork["fm_name"],
                 "final_answer": answer, **_score(question, answer), "token_stats": stats,
-                "injected_at_message_index": fork["injected_at_message_index"],
-                "injected_at_step": side_result.get("injected_at_step"), "injected_at_node": side_result.get("injected_at_node"),
-                "original_message": side_result.get("original_message"), "corrupted_message": fork["corrupted_message"],
-                "messages": final_state.get("messages"), "gricean_history": final_state.get("gricean_history"),
-                "reflection_history": final_state.get("reflection_history"),
             })
     return results
 
 
-def run_magnetic_error_forks_by_source(
+def run_magnetic_error_forks(
+    question: Dict[str, Any],
+    magentic: MagenticOneLangGraph,
+    error_plan: List[Tuple[str, Optional[str]]],
+    strategy: str = "middle_agent_message",
+) -> List[Dict[str, Any]]:
+    """Sync wrapper. Only safe when this is the ONLY call you're making
+    against `magentic` -- if baselines were already run against this same
+    instance, call `run_magnetic_error_forks_async` inside that same event
+    loop instead (see gaia_runner.cli._run_magnetic_async)."""
+    return asyncio.run(run_magnetic_error_forks_async(question, magentic, error_plan, strategy))
+
+
+async def run_magnetic_error_forks_by_source_async(
     question: Dict[str, Any],
     magentic: MagenticOneLangGraph,
     sources: List[str],
@@ -142,28 +167,28 @@ def run_magnetic_error_forks_by_source(
     fm_id: Optional[str] = None,
     seed: int = 42,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Like run_magnetic_error_forks, but instead of one fork at a single
-    shared-prefix position (picked by `strategy`), runs one SEPARATE fork
-    per entry in `sources` (e.g. ["MagenticOneOrchestrator", "FileSurfer",
-    "WebSurfer", "Coder"]) -- each targeting a message chosen at random
-    (seeded, so reproducible) from among that specific agent's messages
-    within the shared baseline/Gricean prefix. All forks branch off the
-    SAME baseline pair (one paired run per question, not per source), so
-    every source's injection point is guaranteed to sit in a region that
-    is byte-identical between checker-off and checker-on up to that point.
+    """Like run_magnetic_error_forks_async, but instead of one fork at a
+    single shared-prefix position (picked by `strategy`), runs one
+    SEPARATE fork per entry in `sources` (e.g. ["MagenticOneOrchestrator",
+    "FileSurfer", "WebSurfer", "Coder"]) -- each targeting a message chosen
+    at random (seeded, so reproducible) from among that specific agent's
+    messages within the shared baseline/Gricean prefix. All forks branch
+    off the SAME baseline pair (one paired run per question, not per
+    source), so every source's injection point is guaranteed to sit in a
+    region that is byte-identical between checker-off and checker-on up to
+    that point.
 
     Returns {source: [checker_off_row, checker_on_row]}; a source with no
     matching message in the shared prefix for this question maps to [].
-    """
+
+    Async core -- see the note on `run_magnetic_baseline_async` above."""
     task = _task_text(question)
-    pair = asyncio.run(run_paired_traces(magentic, task, thread_id_prefix=question["task_id"]))
+    pair = await run_paired_traces(magentic, task, thread_id_prefix=question["task_id"])
 
-    async def _final_messages():
-        baseline_cps = await list_message_checkpoints(magentic.graph, pair["baseline_config"])
-        gricean_cps = await list_message_checkpoints(magentic.graph, pair["gricean_config"])
-        return baseline_cps[-1]["snapshot"].values["messages"], gricean_cps[-1]["snapshot"].values["messages"]
-
-    baseline_messages, gricean_messages = asyncio.run(_final_messages())
+    baseline_cps = await list_message_checkpoints(magentic.graph, pair["baseline_config"])
+    gricean_cps = await list_message_checkpoints(magentic.graph, pair["gricean_config"])
+    baseline_messages = baseline_cps[-1]["snapshot"].values["messages"]
+    gricean_messages = gricean_cps[-1]["snapshot"].values["messages"]
     shared_len = shared_prefix_length(baseline_messages, gricean_messages)
 
     rng = random.Random(seed)
@@ -179,25 +204,37 @@ def run_magnetic_error_forks_by_source(
         if magentic.gricean_model_client is not magentic.client:
             reset_usage_tracking(magentic.gricean_model_client)
 
-        fork = asyncio.run(fork_paired_traces_with_error(
+        fork = await fork_paired_traces_with_error(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
             error_type, ORCHESTRATOR_NAME, fm_id=fm_id, target_message_index=idx,
-        ))
+        )
         stats = token_usage.from_magnetic_token_stats(_combined_usage(magentic))
         rows = []
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
-            side_result = fork[side]
-            final_state = side_result["final_state"]
-            answer = final_state.get("final_answer") or ""
+            answer = fork[side]["final_state"].get("final_answer") or ""
             rows.append({
                 "task_id": question["task_id"], "system": "magnetic_one", "fork_condition": label,
                 "target_source": source, "injected_at_message_index": idx,
                 "error_type": fork["error_type"], "fm_id": fork["fm_id"], "fm_name": fork["fm_name"],
                 "final_answer": answer, **_score(question, answer), "token_stats": stats,
-                "injected_at_step": side_result.get("injected_at_step"), "injected_at_node": side_result.get("injected_at_node"),
-                "original_message": side_result.get("original_message"), "corrupted_message": fork["corrupted_message"],
-                "messages": final_state.get("messages"), "gricean_history": final_state.get("gricean_history"),
-                "reflection_history": final_state.get("reflection_history"),
             })
         results[source] = rows
     return results
+
+
+def run_magnetic_error_forks_by_source(
+    question: Dict[str, Any],
+    magentic: MagenticOneLangGraph,
+    sources: List[str],
+    error_type: str,
+    fm_id: Optional[str] = None,
+    seed: int = 42,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Sync wrapper -- safe on its own since this is the only call made
+    against a fresh `magentic` instance in run_magnetic_agent_forks.py's
+    per-question loop. Kept as an async core + sync wrapper pair anyway
+    for consistency and so future callers can compose it with other async
+    work against the same `magentic` inside one shared event loop."""
+    return asyncio.run(run_magnetic_error_forks_by_source_async(
+        question, magentic, sources, error_type, fm_id=fm_id, seed=seed,
+    ))
