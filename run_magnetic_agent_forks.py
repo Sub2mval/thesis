@@ -32,6 +32,7 @@ Usage (run from the thesis-main/ directory):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -44,7 +45,7 @@ from magnetic_one.ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, load_api
 
 from gaia_runner.error_spec import resolve_error_plan  # noqa: E402
 from gaia_runner.question_select import select_questions  # noqa: E402
-from gaia_runner.magnetic_system import build_magnetic_system, run_magnetic_error_forks_by_source  # noqa: E402
+from gaia_runner.magnetic_system import build_magnetic_system, run_magnetic_error_forks_by_source_async  # noqa: E402
 from gaia_runner import trace_io  # noqa: E402
 
 DEFAULT_SOURCES = ["MagenticOneOrchestrator", "FileSurfer", "WebSurfer", "Coder"]
@@ -91,6 +92,37 @@ def _save_source_rows(out_dir: str, task_id: str, source: str, rows: List[Dict[s
                 f.write(json.dumps(trace_io.summary_row(row, "fork"), default=str) + "\n")
 
 
+async def _run_one_question_async(question: Dict[str, Any], args: argparse.Namespace,
+                                   sources: List[str], error_type: str, fm_id: str) -> None:
+    """Builds the client, runs all the forks, and closes the client --
+    all inside ONE event loop. `run_magnetic_error_forks_by_source_async`
+    and `magentic.close()` both touch `magentic.client`'s connection pool;
+    running them under separate top-level `asyncio.run()` calls (as the
+    previous version did, with a trailing `asyncio.run(magentic.close())`
+    after the sync `run_magnetic_error_forks_by_source` had already run
+    and closed its own loop) is exactly the pattern that raises
+    `RuntimeError: Event loop is closed` -- see gaia_runner.cli for the
+    same fix applied to the main benchmark runner."""
+    if args.ollama_cloud:
+        keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
+        magentic = build_magnetic_system(args.magnetic_model, args.gricean_model, args.ollama_cloud_host, api_keys=keys)
+    else:
+        magentic = build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
+    try:
+        by_source = await run_magnetic_error_forks_by_source_async(
+            question, magentic, sources, error_type, fm_id=fm_id, seed=args.seed,
+        )
+        for source, rows in by_source.items():
+            if not rows:
+                print(f"[skip] {question['task_id']}: no shared-prefix message from '{source}'.")
+                continue
+            _save_source_rows(args.out_dir, question["task_id"], source, rows)
+            print(f"[ok]   {question['task_id']} / {source}: fork saved "
+                  f"(message index {rows[0]['injected_at_message_index']}).")
+    finally:
+        await magentic.close()
+
+
 def main(argv: List[str] = None) -> None:
     load_dotenv()
     args = build_arg_parser().parse_args(argv)
@@ -103,25 +135,7 @@ def main(argv: List[str] = None) -> None:
     questions = select_questions(pool, task_ids=task_ids, seed=args.seed)
 
     for question in questions:
-        if args.ollama_cloud:
-            keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
-            magentic = build_magnetic_system(args.magnetic_model, args.gricean_model, args.ollama_cloud_host, api_keys=keys)
-        else:
-            magentic = build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
-        try:
-            by_source = run_magnetic_error_forks_by_source(
-                question, magentic, sources, error_type, fm_id=fm_id, seed=args.seed,
-            )
-            for source, rows in by_source.items():
-                if not rows:
-                    print(f"[skip] {question['task_id']}: no shared-prefix message from '{source}'.")
-                    continue
-                _save_source_rows(args.out_dir, question["task_id"], source, rows)
-                print(f"[ok]   {question['task_id']} / {source}: fork saved "
-                      f"(message index {rows[0]['injected_at_message_index']}).")
-        finally:
-            import asyncio
-            asyncio.run(magentic.close())
+        asyncio.run(_run_one_question_async(question, args, sources, error_type, fm_id))
 
     print(f"\nDone. {len(questions)} question(s) x up to {len(sources)} agent-type fork(s) written to {args.out_dir}")
 
