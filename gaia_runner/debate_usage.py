@@ -49,9 +49,10 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
     """Same body as langgraph_debate.call_llm, plus a usage record per call."""
 
     @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
-    def instrumented_call_llm(messages: List[Message], config: Dict[str, Any]) -> str:
+    def instrumented_call_llm(messages: List[Message], config: Dict[str, Any], call_type: str = "unknown") -> str:
         model = random.choice(config["model_list"])
-        client = ollama.Client(host=model.get("host", "http://localhost:11434"))
+        headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
+        client = ollama.Client(host=model.get("host", "http://localhost:11434"), headers=headers)
         options = {k: v for k, v in (("temperature", config.get("temperature")),
                                       ("num_predict", config.get("max_tokens")),
                                       ("seed", config.get("seed"))) if v is not None}
@@ -60,6 +61,7 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
         output_tokens = _field(resp, "eval_count")
         records.append({
             "call_index": len(records) + 1,
+            "call_type": call_type,  # "agent_turn" | "reflection" | "gricean_check" | "aggregate" | "corruption"
             "context": model["model"],
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
