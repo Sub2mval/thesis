@@ -95,20 +95,7 @@ def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, 
     return rows
 
 
-async def _run_magnetic_async(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
-    """Async core for _run_magnetic. Everything against one `magentic`
-    instance -- both baseline calls (checker off/on) and the error forks --
-    runs inside this single coroutine/event loop.
-
-    This matters because `magentic.client` is a long-lived ollama/httpx
-    async client: its connection pool binds to whichever event loop is
-    running the first time a request goes out. Calling `asyncio.run()`
-    separately for each baseline (as the old sync-only version did) tears
-    that loop down after the checker-off call returns, so the checker-on
-    call -- on a brand-new loop -- blows up with `RuntimeError: Event loop
-    is closed` as soon as it touches the stale connection. Keeping every
-    await for this `magentic` instance under one `asyncio.run()` avoids
-    that entirely."""
+def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
     from . import magnetic_system  # deferred: keeps a debate-only run from needing autogen installed
     if args.ollama_cloud:
         from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
@@ -118,22 +105,30 @@ async def _run_magnetic_async(question: Dict[str, Any], args: argparse.Namespace
         )
     else:
         magentic = magnetic_system.build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
-    rows: List[Dict[str, Any]] = []
-    for use_check in (False, True):
-        trace = await magnetic_system.run_magnetic_baseline_async(question, magentic, use_check)
-        trace_io.save_baseline_trace(out_dir, trace)
-        rows.append(trace_io.summary_row(trace, "baseline"))
-    forks = await magnetic_system.run_magnetic_error_forks_async(question, magentic, error_plan)
-    for i, fork_trace in enumerate(forks):
-        trace_io.save_fork_trace(out_dir, fork_trace, i)
-        rows.append(trace_io.summary_row(fork_trace, "fork"))
-    for row in rows:
-        trace_io.append_summary_row(out_dir, row)
-    return rows
-
-
-def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
-    return asyncio.run(_run_magnetic_async(question, args, error_plan, out_dir))
+    try:
+        rows: List[Dict[str, Any]] = []
+        for use_check in (False, True):
+            trace = magnetic_system.run_magnetic_baseline(question, magentic, use_check)
+            trace_io.save_baseline_trace(out_dir, trace)
+            rows.append(trace_io.summary_row(trace, "baseline"))
+        forks = magnetic_system.run_magnetic_error_forks(question, magentic, error_plan)
+        for i, fork_trace in enumerate(forks):
+            trace_io.save_fork_trace(out_dir, fork_trace, i)
+            rows.append(trace_io.summary_row(fork_trace, "fork"))
+        for row in rows:
+            trace_io.append_summary_row(out_dir, row)
+        return rows
+    finally:
+        # Each question builds a fresh `magentic` (and its Ollama clients),
+        # each of which was previously left for garbage collection whenever
+        # Python got around to it -- which, since GC timing is arbitrary,
+        # could land during a LATER question's own asyncio.run() loop and
+        # try to tear down a connection bound to this (now-closed) one,
+        # a plausible contributor to "Event loop is closed" crashes deep in
+        # httpx/httpcore cleanup. Closing explicitly, before the next
+        # question's loop even exists, removes that race. Mirrors the
+        # cleanup run_magnetic_agent_forks.py already does.
+        asyncio.run(magentic.close())
 
 
 def main(argv: List[str] = None) -> None:
