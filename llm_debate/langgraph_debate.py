@@ -152,6 +152,13 @@ class DebateState(TypedDict):
     agent_idx: int
     contexts: List[List[Message]]
     adherence: Dict[int, Dict[str, str]]
+    # Append-only: one entry per Gricean check, added here in gricean_check().
+    # `adherence` above stays as the transient "latest verdict per agent"
+    # cache construct_broadcast() reads for live notice-gating -- it gets
+    # overwritten every time that agent speaks again, so on its own it
+    # can't answer "what did the checker say about round 1?" once round 2
+    # has run. This list is what actually preserves that per-message history.
+    gricean_history: List[Dict[str, Any]]
     reflections: Dict[int, List[Dict[str, Any]]]
     final_answer: Optional[str]
     config: Dict[str, Any]
@@ -178,7 +185,7 @@ def _build_initial_message(query: str, attachment: Optional[Dict[str, Any]]) -> 
 def init_agents(state: DebateState) -> Dict[str, Any]:
     msg = _build_initial_message(state["query"], state.get("attachment"))
     return {"contexts": [[dict(msg)] for _ in range(state["agents_num"])], "round": 0, "agent_idx": 0,
-            "adherence": {}, "reflections": {}}
+            "adherence": {}, "gricean_history": [], "reflections": {}}
 
 
 def agent_turn(state: DebateState) -> Dict[str, Any]:
@@ -231,9 +238,20 @@ def gricean_check(state: DebateState) -> Dict[str, Any]:
     prompt = format_gricean_check_prompt(state["query"], conversation, f"Agent {speaker + 1}")
     scores = parse_gricean_scores(call_llm([{"role": "user", "content": prompt}], state["config"], call_type="gricean_check"))
     level = score_to_gricean_level({m: scores[m]["score"] for m in GRICEAN_METRICS})
+    reason = format_combined_reason(scores)
     adherence = dict(state["adherence"])
-    adherence[speaker] = {"level": level, "reason": format_combined_reason(scores)}
-    return {"adherence": adherence}
+    adherence[speaker] = {"level": level, "reason": reason}
+    # agent_turn already advanced state["round"] to round+1 by the time this
+    # node runs, but only when `speaker` was the last agent in that round
+    # (next_i wrapped to 0) -- undo that so the logged round matches the
+    # round the checked message actually belongs to.
+    msg_round = state["round"] - 1 if speaker == state["agents_num"] - 1 else state["round"]
+    gricean_history = list(state["gricean_history"])
+    gricean_history.append({
+        "round": msg_round, "agent_id": speaker, "level": level, "reason": reason,
+        "scores": {m: scores[m]["score"] for m in GRICEAN_METRICS},
+    })
+    return {"adherence": adherence, "gricean_history": gricean_history}
 
 
 def aggregate(state: DebateState) -> Dict[str, Any]:
@@ -278,8 +296,8 @@ def run_debate(query: str, config: Dict[str, Any], agents_num: int = 3, rounds_n
     app = build_graph()
     result = app.invoke(
         {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
-         "contexts": [], "adherence": {}, "reflections": {}, "final_answer": None, "config": config,
-         "use_gricean_check": use_gricean_check, "attachment": attachment},
+         "contexts": [], "adherence": {}, "gricean_history": [], "reflections": {}, "final_answer": None,
+         "config": config, "use_gricean_check": use_gricean_check, "attachment": attachment},
         config={"recursion_limit": 300},
     )
     return result
