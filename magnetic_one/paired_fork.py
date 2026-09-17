@@ -7,19 +7,32 @@ Gricean checker never touches MessageHistory itself (see gricean_checker.
 py) -- it only ever adds a `pending_reflection` that the *next* agent's
 own prompt includes, and only does so when the flag is on. So with the
 same model, seed, and task, a baseline run (flag off) and a
-Gricean-checked run (flag on) produce byte-identical MessageHistory right
-up to the first message that would have been flagged not_high; only what's
-generated *after* that point can differ. The checker still SCORES every
-message in both runs either way (see state.py), so `gricean_history` from
-the baseline run is directly comparable to the checked run's, message for
-message, up to and including the divergence point.
+Gricean-checked run (flag on) are MECHANISTICALLY identical -- same
+prompts fed to the same model -- right up to the first message that
+would have been flagged not_high; only what's generated *after* that
+point can differ in a way attributable to the checker.
+
+NOTE this is a mechanistic guarantee, not a textual one: on Ollama Cloud,
+RotatingKeyOllamaClient can rotate keys mid-run (rate-limit/auth
+retries), and different backend replicas aren't guaranteed to reproduce
+identical sampled tokens even at temperature=0/seed=42 for an identical
+request -- so the two traces' message *content* can legitimately differ
+before either has been flagged. `shared_prefix_length` below therefore
+determines the safe-to-fork region from each trace's own Gricean
+verdicts (first not_high message_index), not from literal content
+equality -- see its docstring for the full reasoning.
+
+The checker still SCORES every message in both runs either way (see
+state.py), so `gricean_history` from the baseline run is directly
+comparable to the checked run's, message for message, up to and
+including the divergence point.
 
 `run_paired_traces` runs both under one MagenticOneLangGraph instance
 (same checkpointer, two thread_ids). `fork_paired_traces_with_error` then
-finds a message index inside that guaranteed-identical shared prefix,
-generates ONE corrupted message, and injects that exact same corruption
-into both forks -- so any difference in what happens next is attributable
-to the Gricean checker alone, not to incidental prompt drift or a second,
+finds a message index inside that shared prefix, generates ONE corrupted
+message, and injects that exact same corruption into both forks -- so
+any difference in what happens next is attributable to the Gricean
+checker alone, not to incidental prompt drift or a second,
 independently-sampled corruption.
 """
 
@@ -38,9 +51,53 @@ except ImportError:  # pragma: no cover
     MagenticOneLangGraph = Any  # type: ignore
 
 
-def shared_prefix_length(baseline_messages: List[ThreadMessage], gricean_messages: List[ThreadMessage]) -> int:
-    """How many leading messages are identical (same source AND content)
-    between the two traces -- the region it's safe to fork from."""
+def shared_prefix_length(
+    baseline_messages: List[ThreadMessage],
+    gricean_messages: List[ThreadMessage],
+    baseline_gricean_history: Optional[List[Dict[str, Any]]] = None,
+    gricean_gricean_history: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """How many leading messages are safe to fork from.
+
+    Originally this required literal content equality (same source AND
+    content) between the two traces -- the module docstring's claim that
+    temperature=0/seed=42 makes the two runs byte-identical up to the
+    first not_high verdict. In practice this proved too strict on Ollama
+    Cloud: RotatingKeyOllamaClient (ollama_cloud_client.py) rotates to a
+    different key on a rate-limit/auth error mid-run, and a different
+    backend replica isn't guaranteed to reproduce the exact same sampled
+    tokens for an identical request even at temperature 0 -- so content
+    could differ from message 0, well before the checker had done
+    anything, causing every source to [skip] with "no shared-prefix
+    message" even on ordinary runs.
+
+    The guarantee this experiment actually depends on is behavioral, not
+    textual: the checker scores every message in both runs regardless of
+    `enable_gricean_check`, and only ever *acts* on a not_high score
+    (via `pending_reflection`) when the flag is on. So checker-on's
+    trajectory is mechanistically identical to checker-off's -- same
+    prompts, same model -- right up until checker-on's own first not_high
+    verdict actually injects a reflection into what the next agent sees.
+    Before that point, differing wording between the two traces is cloud
+    sampling noise, not a real divergence caused by the checker.
+
+    So: when gricean_history is supplied for both sides, the cutoff is
+    the message_index of the first not-high verdict in EITHER trace's
+    history (whichever comes first), not content comparison at all.
+    Falls back to the original literal-equality check if history isn't
+    passed in (e.g. an older/direct call site)."""
+    if baseline_gricean_history is not None and gricean_gricean_history is not None:
+        def _first_not_high(history: List[Dict[str, Any]]) -> Optional[int]:
+            for entry in history:
+                if entry.get("adherence_level") != "high":
+                    return entry.get("message_index")
+            return None
+
+        cutoffs = [c for c in (_first_not_high(baseline_gricean_history), _first_not_high(gricean_gricean_history))
+                   if c is not None]
+        limit = min(cutoffs) if cutoffs else min(len(baseline_messages), len(gricean_messages))
+        return max(0, min(limit, len(baseline_messages), len(gricean_messages)))
+
     n = 0
     for a, b in zip(baseline_messages, gricean_messages):
         if a["source"] != b["source"] or a["content"] != b["content"]:
@@ -54,8 +111,10 @@ def choose_shared_target_index(
     gricean_messages: List[ThreadMessage],
     orchestrator_name: str,
     strategy: str = "middle_agent_message",
+    baseline_gricean_history: Optional[List[Dict[str, Any]]] = None,
+    gricean_gricean_history: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
-    shared_len = shared_prefix_length(baseline_messages, gricean_messages)
+    shared_len = shared_prefix_length(baseline_messages, gricean_messages, baseline_gricean_history, gricean_gricean_history)
     if shared_len == 0:
         raise ValueError("Baseline and Gricean-checked traces share no common prefix -- nothing to fork from.")
 
@@ -126,12 +185,15 @@ async def fork_paired_traces_with_error(
     gricean_checkpoints = await list_message_checkpoints(graph, gricean_config)
     baseline_messages = baseline_checkpoints[-1]["snapshot"].values["messages"]
     gricean_messages = gricean_checkpoints[-1]["snapshot"].values["messages"]
+    baseline_gricean_history = baseline_checkpoints[-1]["snapshot"].values.get("gricean_history", [])
+    gricean_gricean_history = gricean_checkpoints[-1]["snapshot"].values.get("gricean_history", [])
 
     if target_message_index is None:
-        idx = choose_shared_target_index(baseline_messages, gricean_messages, orchestrator_name, strategy)
+        idx = choose_shared_target_index(baseline_messages, gricean_messages, orchestrator_name, strategy,
+                                          baseline_gricean_history, gricean_gricean_history)
     else:
         idx = target_message_index
-        shared_len = shared_prefix_length(baseline_messages, gricean_messages)
+        shared_len = shared_prefix_length(baseline_messages, gricean_messages, baseline_gricean_history, gricean_gricean_history)
         if idx >= shared_len:
             raise ValueError(f"message index {idx} is not in the shared prefix (only the first {shared_len} messages are guaranteed identical).")
 
