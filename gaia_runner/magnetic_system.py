@@ -15,10 +15,10 @@ import asyncio
 import os
 import random
 import sys
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
+from . import trace_io  # noqa: E402
 from llm_debate import gaia_utils  # noqa: E402
 from magnetic_one.magnetic_one_langgraph import MagenticOneLangGraph  # noqa: E402
 from magnetic_one.prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT  # noqa: E402
@@ -70,18 +70,13 @@ def _score(answer_text: str, ground_truth: Any) -> Tuple[str, bool]:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return trace_io.now_iso()
 
 
 def _condition_str(fm_id: Optional[str], injected_at_message_index: Optional[int], use_gricean_check: Optional[bool]) -> str:
-    """Matches the project's existing trace naming convention, e.g.
-    fm_id="FM-1.1", injected_at_message_index=1 -> "fm1_1_msg1"; a plain
-    baseline (no fork) -> "baseline_on"/"baseline_off"."""
-    if fm_id is None:
-        return "baseline_on" if use_gricean_check else "baseline_off"
-    fm_slug = fm_id.lower().replace("-", "").replace(".", "_")
-    suffix = f"_msg{injected_at_message_index}" if injected_at_message_index is not None else ""
-    return f"{fm_slug}{suffix}"
+    """Thin wrapper kept for local readability -- see trace_io.condition_str
+    for the actual (shared-with-debate_system.py) implementation."""
+    return trace_io.condition_str(fm_id, injected_at_message_index, use_gricean_check)
 
 
 def _trust_history(gricean_history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
