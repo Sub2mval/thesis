@@ -1,17 +1,24 @@
 """
-Common token-usage schema shared by both MAS adapters, so a trace's
-`token_stats` looks the same regardless of which MAS produced it:
+Token-usage aggregation for llm_debate's traces. This shape now matches
+magnetic_one's own usage_stats() shape (see ../magnetic_one/ollama_client.py
+and ollama_cloud_client.py, and magnetic_system.py's _combined_usage) --
+previously this module normalized BOTH systems down to a smaller common
+schema (input_tokens/output_tokens only, no per-attempt status, no
+timing); that normalization was dropped in favor of the richer shape
+both MAS's raw instrumentation already computes, so nothing generated
+gets discarded before it reaches a trace:
 
-    {"n_llm_calls": int, "input_tokens": int, "output_tokens": int,
-     "total_tokens": int, "calls": [CallRecord, ...]}
+    {"n_llm_calls": int, "n_successful_calls": int, "n_failed_attempts": int,
+     "prompt_tokens": int, "completion_tokens": int, "total_tokens": int,
+     "calls": [CallRecord, ...]}
 
-CallRecord (one per LLM call, in call order):
-    {"call_index": int, "context": Optional[str], "input_tokens": Optional[int],
-     "output_tokens": Optional[int], "total_tokens": int, "token_source": str}
-
-`context` is a short free-text label for which agent/step the call
-belongs to (e.g. a source name, or the model name for llm_debate, whose
-calls aren't attributed to a named agent).
+CallRecord (one per LLM call ATTEMPT, in call order -- a retried call
+produces one record per attempt, not just the successful one):
+    {"call_index": int, "call_type": str, "started_at_unix": float,
+     "elapsed_seconds": float, "input_message_count": int,
+     "input_sources": List[str], "context": Optional[str],
+     "prompt_tokens": Optional[int], "completion_tokens": Optional[int],
+     "total_tokens": int, "token_source": str, "status": "ok"|"error"}
 """
 
 from __future__ import annotations
@@ -21,34 +28,15 @@ from typing import Any, Dict, List
 
 def summarize_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Builds the trace-level totals from a list of per-call records
-    already in the CallRecord shape above."""
-    input_tokens = sum(c.get("input_tokens") or 0 for c in calls)
-    output_tokens = sum(c.get("output_tokens") or 0 for c in calls)
+    already in the CallRecord shape above (see debate_usage.py)."""
+    prompt_tokens = sum(c.get("prompt_tokens") or 0 for c in calls)
+    completion_tokens = sum(c.get("completion_tokens") or 0 for c in calls)
     return {
         "n_llm_calls": len(calls),
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "n_successful_calls": sum(c.get("status") == "ok" for c in calls),
+        "n_failed_attempts": sum(c.get("status") == "error" for c in calls),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
         "calls": calls,
     }
-
-
-def from_magnetic_token_stats(token_stats: Dict[str, Any]) -> Dict[str, Any]:
-    """Adapts magnetic_one's own usage tracking (ollama_client.py's
-    prompt_tokens/completion_tokens naming) to the common schema above,
-    without touching magnetic_one's code. Accepts either the full
-    `token_stats` dict MagenticOneLangGraph.run() attaches, or a bare
-    {"calls": [...]} dict assembled by gaia_runner itself (see
-    magnetic_system.py's _combined_usage)."""
-    calls = [
-        {
-            "call_index": c.get("call_index"),
-            "context": ",".join(s for s in (c.get("input_sources") or []) if s) or None,
-            "input_tokens": c.get("prompt_tokens"),
-            "output_tokens": c.get("completion_tokens"),
-            "total_tokens": c.get("total_tokens", 0),
-            "token_source": c.get("token_source"),
-        }
-        for c in token_stats.get("calls", [])
-    ]
-    return summarize_calls(calls)
