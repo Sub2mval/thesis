@@ -14,7 +14,24 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def condition_str(fm_id: Optional[str], injected_at_message_index: Optional[int], use_gricean_check: Optional[bool]) -> str:
+    """Shared by both MAS adapters so a trace's `condition` field is built
+    the same way regardless of system, e.g. fm_id="FM-1.1",
+    injected_at_message_index=1 -> "fm1_1_msg1"; a plain baseline (no
+    fork) -> "baseline_on"/"baseline_off"."""
+    if fm_id is None:
+        return "baseline_on" if use_gricean_check else "baseline_off"
+    fm_slug = fm_id.lower().replace("-", "").replace(".", "_")
+    suffix = f"_msg{injected_at_message_index}" if injected_at_message_index is not None else ""
+    return f"{fm_slug}{suffix}"
 
 
 def _write_json(path: str, payload: Dict[str, Any]) -> None:
