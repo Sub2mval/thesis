@@ -218,6 +218,16 @@ class RotatingKeyOllamaClient:
         start_idx = self._idx
         consecutive_full_cycles = 0
         auth_errors_this_cycle: List[str] = []
+        # Unclassified exceptions (e.g. a transient connection-teardown race
+        # like `RuntimeError: Event loop is closed` surfacing from deep
+        # inside httpx/httpcore's connection cleanup) previously killed the
+        # whole run immediately -- unlike llm_debate's call_llm, which has a
+        # blanket @retry(stop_after_attempt(5)) around every call. Give the
+        # SAME key a few short-backoff retries before giving up, since these
+        # aren't quota/auth issues specific to one key and rotating keys
+        # wouldn't help; distinct from the rate-limit rotation loop below.
+        unclassified_retries = 0
+        max_unclassified_retries = 4
 
         while True:
             client = self._clients[self._idx]
@@ -233,7 +243,17 @@ class RotatingKeyOllamaClient:
             except Exception as e:
                 kind = _classify_error(e)
                 if kind is None:
-                    raise
+                    unclassified_retries += 1
+                    if unclassified_retries > max_unclassified_retries:
+                        raise
+                    wait = min(self._base_backoff * unclassified_retries, self._max_backoff)
+                    logger.warning(
+                        "Unclassified error on %s (attempt %d/%d, not a rate-limit/auth error so not rotating "
+                        "keys): %s. Retrying in %.1fs.",
+                        self._key_label(self._idx), unclassified_retries, max_unclassified_retries, e, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
 
                 if kind == "auth":
                     auth_errors_this_cycle.append(self._key_label(self._idx))
