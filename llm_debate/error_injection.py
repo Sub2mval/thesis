@@ -383,8 +383,8 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     cfg_off = {"configurable": {"thread_id": "baseline"}, "recursion_limit": 300}
     cfg_on = {"configurable": {"thread_id": "gricean"}, "recursion_limit": 300}
     base = {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
-            "contexts": [], "adherence": {}, "reflections": {}, "final_answer": None, "config": debate_config,
-            "attachment": attachment}
+            "contexts": [], "adherence": {}, "gricean_history": [], "reflections": {}, "final_answer": None,
+            "config": debate_config, "attachment": attachment}
 
     await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
     await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
