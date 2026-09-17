@@ -27,6 +27,7 @@ import contextlib
 import os
 import random
 import sys
+import time
 from typing import Any, Dict, List
 
 import ollama  # noqa: E402
@@ -46,7 +47,13 @@ def _field(resp: Any, name: str) -> Any:
 
 
 def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
-    """Same body as langgraph_debate.call_llm, plus a usage record per call."""
+    """Same body as langgraph_debate.call_llm, plus a usage record per
+    ATTEMPT (not just per successful call -- see the except branch below),
+    in the same rich shape magnetic_one's InstrumentedOllamaChatCompletionClient
+    already used (started_at_unix/elapsed_seconds/input_message_count/
+    input_sources/status/prompt_tokens/completion_tokens), so both MAS
+    adapters produce directly comparable token_stats rather than debate's
+    getting a smaller, lossier shape."""
 
     @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
     def instrumented_call_llm(messages: List[Message], config: Dict[str, Any], call_type: str = "unknown") -> str:
@@ -56,19 +63,37 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
         options = {k: v for k, v in (("temperature", config.get("temperature")),
                                       ("num_predict", config.get("max_tokens")),
                                       ("seed", config.get("seed"))) if v is not None}
-        resp = client.chat(model=model["model"], messages=messages, options=options)
-        input_tokens = _field(resp, "prompt_eval_count")
-        output_tokens = _field(resp, "eval_count")
-        records.append({
-            "call_index": len(records) + 1,
+        call_index = len(records) + 1
+        started = time.time()
+        common = {
+            "call_index": call_index,
             "call_type": call_type,  # "agent_turn" | "reflection" | "gricean_check" | "aggregate" | "corruption"
-            "context": model["model"],
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": (input_tokens or 0) + (output_tokens or 0),
-            "token_source": "ollama_native" if input_tokens is not None else "unavailable",
-        })
-        return resp["message"]["content"]
+            "started_at_unix": started, "input_message_count": len(messages),
+            "input_sources": [m.get("role") for m in messages], "context": model.get("model"),
+        }
+        try:
+            resp = client.chat(model=model["model"], messages=messages, options=options)
+            prompt_tokens = _field(resp, "prompt_eval_count")
+            completion_tokens = _field(resp, "eval_count")
+            records.append({
+                **common, "elapsed_seconds": time.time() - started,
+                "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                "total_tokens": (prompt_tokens or 0) + (completion_tokens or 0),
+                "token_source": "ollama_native" if prompt_tokens is not None else "unavailable",
+                "status": "ok",
+            })
+            return resp["message"]["content"]
+        except Exception as exc:
+            # Recorded (not discarded) even on failure -- tenacity will
+            # retry the whole call, so one logical LLM call can produce
+            # several of these records; n_failed_attempts in
+            # token_usage.summarize_calls counts them.
+            records.append({
+                **common, "elapsed_seconds": time.time() - started,
+                "prompt_tokens": None, "completion_tokens": None, "total_tokens": 0,
+                "token_source": "unavailable", "status": "error", "error": f"{type(exc).__name__}: {exc}",
+            })
+            raise
 
     return instrumented_call_llm
 
