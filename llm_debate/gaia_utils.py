@@ -411,7 +411,16 @@ def load_gaia_questions(
         if text_only and file_name.strip():
             continue
 
-        file_path = item.get("file_path")  # local jsonl may specify this directly
+        file_path = None if use_hub else item.get("file_path")
+        # The Hugging Face GAIA dataset ships its own "file_path" field per
+        # item -- a path RELATIVE to the repo (e.g.
+        # "2023/validation/<file>.xlsx"), not a resolved local filesystem
+        # path -- so it's never usable as-is and must never be treated as
+        # one; only file_name -> attachment_index resolution (below) is
+        # trusted for hub-loaded items. A local jsonl's own "file_path"
+        # field, by contrast, is this project's own convention for "I'm
+        # already giving you a real local path, skip resolution" and is
+        # used directly.
         if not file_path and file_name.strip():
             file_path = attachment_index.get(file_name)
         if file_name.strip() and not file_path:
