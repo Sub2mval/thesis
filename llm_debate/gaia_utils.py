@@ -33,12 +33,13 @@
 #   - DOCX   -> paragraph + table text extracted (requires python-docx)
 #   - XLSX/XLS -> cell values extracted per sheet (requires openpyxl)
 #   - PPTX   -> slide text extracted (requires python-pptx)
-#   - anything else (archives, proprietary formats, ...) -> not supported;
-#     noted in the returned dict rather than silently dropped.
-# Each optional dependency is only imported when actually needed, and a
-# missing one degrades to "unsupported" with an explanatory note instead of
-# crashing the run.
-# Set text_only=True to go back to skipping every file-attached question.
+#   - anything else (archives, proprietary formats, ...) -> not supported.
+# A GAIA question that declares an attachment (non-empty file_name) must
+# not silently run as text-only: load_gaia_questions() raises if the file
+# can't be resolved to a local path, and load_attachment() raises if the
+# resolved file's contents can't actually be extracted (missing optional
+# dependency, corrupt file, or a genuinely unsupported format) -- pass
+# text_only=True to explicitly skip file-attached questions instead.
 # ---------------------------------------------------------------------------
 
 import base64
@@ -56,6 +57,22 @@ XLSX_EXTENSIONS = {".xlsx", ".xls"}
 PPTX_EXTENSIONS = {".pptx"}
 
 _ATTACHMENT_INDEX_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _index_directory(root: str) -> Dict[str, str]:
+    """Builds a {filename: local_path} index by walking `root` once (first
+    occurrence of a given filename wins), cached by `root` so repeated
+    per-question lookups don't re-walk the tree. Shared by both the
+    Hugging Face hub snapshot path and the local-dataset path below, so
+    attachment resolution works the same way regardless of source."""
+    if root in _ATTACHMENT_INDEX_CACHE:
+        return _ATTACHMENT_INDEX_CACHE[root]
+    index: Dict[str, str] = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            index.setdefault(fn, os.path.join(dirpath, fn))
+    _ATTACHMENT_INDEX_CACHE[root] = index
+    return index
 
 
 def _get_gaia_attachment_index(split: str) -> Dict[str, str]:
@@ -86,11 +103,7 @@ def _get_gaia_attachment_index(split: str) -> Dict[str, str]:
         _ATTACHMENT_INDEX_CACHE[split] = {}
         return {}
 
-    index: Dict[str, str] = {}
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for fn in filenames:
-            index.setdefault(fn, os.path.join(dirpath, fn))
-
+    index = _index_directory(root)
     _ATTACHMENT_INDEX_CACHE[split] = index
     return index
 
@@ -279,34 +292,45 @@ def load_attachment(
 ) -> Dict[str, Any]:
     """
     Reads one attachment file into a dict init_agents can consume directly:
-        {"kind": "image" | "text" | "audio" | "unsupported",
+        {"kind": "image" | "text" | "audio",
          "text": Optional[str],
          "images_b64": List[str],
          "audio_b64": List[str],
          "note": Optional[str]}
     "kind": "image" covers real images, PDF pages, and sampled video frames --
     all just lists of base64 PNGs from init_agents' point of view.
+
+    Raises RuntimeError if the file's contents could not actually be
+    extracted (missing optional dependency, corrupt/unreadable file, or a
+    genuinely unsupported format) -- a GAIA question that declares an
+    attachment must not silently run as if it were text-only; the caller
+    finds out immediately instead of the model quietly answering without
+    the file the question depends on.
     """
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext in IMAGE_EXTENSIONS:
-        return _load_image(file_path)
-    if ext in TEXT_EXTENSIONS:
-        return _load_text(file_path, max_text_chars)
-    if ext == ".pdf":
-        return _load_pdf(file_path, max_pdf_pages)
-    if ext in AUDIO_EXTENSIONS:
-        return _load_audio(file_path)
-    if ext in VIDEO_EXTENSIONS:
-        return _load_video(file_path, max_video_frames)
-    if ext in DOCX_EXTENSIONS:
-        return _load_docx(file_path, max_text_chars)
-    if ext in XLSX_EXTENSIONS:
-        return _load_xlsx(file_path, max_text_chars)
-    if ext in PPTX_EXTENSIONS:
-        return _load_pptx(file_path, max_text_chars)
+        result = _load_image(file_path)
+    elif ext in TEXT_EXTENSIONS:
+        result = _load_text(file_path, max_text_chars)
+    elif ext == ".pdf":
+        result = _load_pdf(file_path, max_pdf_pages)
+    elif ext in AUDIO_EXTENSIONS:
+        result = _load_audio(file_path)
+    elif ext in VIDEO_EXTENSIONS:
+        result = _load_video(file_path, max_video_frames)
+    elif ext in DOCX_EXTENSIONS:
+        result = _load_docx(file_path, max_text_chars)
+    elif ext in XLSX_EXTENSIONS:
+        result = _load_xlsx(file_path, max_text_chars)
+    elif ext in PPTX_EXTENSIONS:
+        result = _load_pptx(file_path, max_text_chars)
+    else:
+        result = _empty_attachment("unsupported", f"file type '{ext}' not yet supported by this pipeline")
 
-    return _empty_attachment("unsupported", f"file type '{ext}' not yet supported by this pipeline")
+    if result["kind"] == "unsupported":
+        raise RuntimeError(f"Could not read attachment '{file_path}': {result.get('note')}")
+    return result
 
 
 def load_gaia_questions(
@@ -319,8 +343,11 @@ def load_gaia_questions(
 ) -> List[Dict[str, Any]]:
     """
     Returns a list of dicts: {"task_id", "query", "ground_truth", "level", "file_name", "file_path"}.
-    file_path is the resolved local path to the attachment (None if there is
-    no attachment, or if it couldn't be located/downloaded).
+    file_path is the resolved local path to the attachment (None only if
+    the question has no attachment at all). If a question declares an
+    attachment (non-empty file_name) but it cannot be resolved to a local
+    file, this raises FileNotFoundError rather than returning file_path=None
+    -- see the module docstring above.
 
     source: "huggingface" (default) or "local" (requires local_path pointing
         at a .json array or .jsonl file with the same field names GAIA uses:
@@ -366,7 +393,17 @@ def load_gaia_questions(
             raise RuntimeError(f"{hint}\n{e}") from e
         raw = list(ds)
 
-    attachment_index = _get_gaia_attachment_index(split) if (use_hub and not text_only) else {}
+    attachment_index: Dict[str, str] = {}
+    if not text_only:
+        if use_hub:
+            attachment_index = _get_gaia_attachment_index(split)
+        elif local_path is not None:
+            # Mirrors the hub path above: GAIA's local exports conventionally
+            # ship each split's attachments alongside its metadata file (or
+            # in a subdirectory of it), so index the directory containing
+            # `local_path` the same way the hub snapshot's directory is
+            # indexed -- no hardcoded task/file names involved.
+            attachment_index = _index_directory(os.path.dirname(os.path.abspath(local_path)))
 
     questions = []
     for item in raw:
@@ -377,8 +414,18 @@ def load_gaia_questions(
         file_path = item.get("file_path")  # local jsonl may specify this directly
         if not file_path and file_name.strip():
             file_path = attachment_index.get(file_name)
-            if file_path is None and use_hub:
-                print(f"[warn] could not locate attachment '{file_name}' for task {item.get('task_id')}")
+        if file_name.strip() and not file_path:
+            # An attachment was declared but could not be resolved to an
+            # actual local file -- do NOT let this silently fall through
+            # as a text-only run (the model would then answer without the
+            # file GAIA says the question depends on, with nothing in the
+            # trace to show that happened). Fail loudly instead.
+            raise FileNotFoundError(
+                f"GAIA task {item.get('task_id')!r} declares attachment '{file_name}' but its local "
+                f"file could not be resolved (searched "
+                f"{'the GAIA hub snapshot' if use_hub else os.path.dirname(os.path.abspath(local_path))}). "
+                "Pass text_only=True to explicitly skip file-attached questions instead, if that's intended."
+            )
 
         questions.append({
             "task_id": item.get("task_id"),
