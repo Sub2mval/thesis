@@ -12,14 +12,15 @@
 # verbatim; only the state-shape-specific plumbing is rewritten.
 #
 # Headline feature: run_paired_fork_experiment() runs the baseline
-# (checker off) and Gricean-checker-on debates side by side, each under its
-# own checkpointer, and looks for a checkpoint that is BYTE-IDENTICAL in
-# both traces (guaranteed to exist for any prefix before the checker's
-# first NOT_HIGH verdict -- a HIGH verdict never triggers a reflection call
-# in agent_turn, so the two runs stay in lockstep until the first NOT_HIGH).
-# It generates exactly ONE corruption and forks BOTH runs from that
-# shared checkpoint with the identical corrupted content, so both
-# continuations start from provably identical message histories and any
+# (checker off) and Trust_Allocator-on debates side by side, each under its
+# own checkpointer, picks ONE fork point using the selected experiment
+# design's own intervention semantics (see run_paired_fork_experiment's
+# docstring -- Designs 1/2 intervene on every message and always fork at
+# the second checkpoint; Designs 3/4 only intervene from the first
+# non-HIGH Trust_Allocator verdict onward, so any checkpoint before that
+# is fair game), generates exactly ONE corruption there, and forks BOTH
+# runs from that point with the identical corrupted content, so both
+# continuations start from the same message history shape and any
 # difference afterward is attributable to the checker, not to the two runs
 # having already drifted apart before the injection.
 
@@ -358,11 +359,36 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
                                       records: Optional[List[Dict[str, Any]]] = None,
                                       ) -> Dict[str, Any]:
     """Runs the SAME debate twice -- checker off, checker on -- each under
-    its own MemorySaver/thread, locates a checkpoint whose (agent_id,
-    position) AND content match exactly across both traces (verified, not
-    assumed -- see the content equality check below), generates ONE
-    corruption there, and forks both graphs from that shared point with
-    the identical corrupted content.
+    its own MemorySaver/thread, picks ONE fork point using the selected
+    experiment design's own intervention semantics (see below), generates
+    ONE corruption there, and forks both graphs from that point with the
+    identical corrupted content.
+
+    Fork-point selection (`experiment_design`, see repo-root
+    experiment_design.py):
+      - Designs "1"/"2" apply a Trust_Allocator notice to EVERY message
+        (there is no "before the checker did anything" region), so there
+        is nothing to search for: the historical experiment for these
+        designs always injects at the second eligible checkpoint,
+        regardless of `strategy`.
+      - Designs "3"/"4" treat a HIGH verdict as transparent (no notice, no
+        reflection -- see gricean_check()/agent_turn() in
+        langgraph_debate.py), so the checker-on run only starts behaving
+        differently from checker-off at its first non-HIGH Trust_Allocator
+        verdict. Only checkpoints before that point are eligible, and
+        `strategy` ("first_agent_message" / "middle_agent_message" /
+        "last_agent_message") picks among them exactly as it always has.
+
+    Unlike the byte-identical-content matching this replaced, no content
+    comparison between the two runs is needed or performed: cps_off and
+    cps_on always share the same (agent_id, position) sequence turn for
+    turn, because the debate's graph topology (which agent speaks in which
+    round) depends only on agents_num/rounds_num, never on the
+    Trust_Allocator's verdicts -- a flagged message triggers a private
+    reflection call (agent_turn), but that reflection is never appended to
+    `contexts`, so it can only change a later message's CONTENT, never the
+    checkpoint structure. Pairing cps_off[i] with cps_on[i] by index is
+    therefore always valid, regardless of what the Trust_Allocator decided.
 
     Returns a dict:
         {"no_error_off": <full DebateState, checker off, un-forked>,
@@ -388,26 +414,18 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
 
     `attachment` (shape of gaia_utils.load_attachment()'s return value) is
     passed to BOTH graphs via the shared `base` dict below, not loaded or
-    attached separately per side. That's deliberate, not incidental: both
-    graphs run init_agents() -- the same pure function of `query` and
-    `attachment` -- as their very first, identical step, so handing them
-    the same attachment object guarantees the attachment is embedded at
-    the same step (init_agents, before either graph's first agent_turn)
-    and in the same order (all `agents_num` agents get an identical copy,
-    built by the same list comprehension) in both traces. That's exactly
-    what the byte-identical-shared-checkpoint search below depends on: if
-    the two sides ever built their initial message differently -- e.g. one
-    attached and one not -- they would never share a checkpoint at all,
-    and this function would always raise the "no checkpoint is
-    byte-identical" error below. Do not load or construct the attachment
+    attached separately per side -- both graphs run init_agents() (the
+    same pure function of `query` and `attachment`) as their identical
+    first step, so both build their first message the same way, in the
+    same order, for every agent. Do not load or construct the attachment
     separately for graph_off vs. graph_on.
 
-    `experiment_design` (see repo-root experiment_design.py) is threaded
-    into BOTH graph_off's and graph_on's initial state unchanged -- the
-    same selected design must survive the fork, since it's what
-    langgraph_debate.gricean_check() / construct_broadcast() key off of
-    on each side. It also gets folded into each side's thread_id so
-    traces from different designs never collide in the same MemorySaver.
+    `experiment_design` is threaded into BOTH graph_off's and graph_on's
+    initial state unchanged -- the same selected design must survive the
+    fork, since it's what langgraph_debate.gricean_check() /
+    construct_broadcast() key off of on each side. It also gets folded
+    into each side's thread_id so traces from different designs never
+    collide in the same MemorySaver.
     """
     saver_off, saver_on = MemorySaver(), MemorySaver()
     graph_off, graph_on = build_graph(saver_off), build_graph(saver_on)
@@ -427,17 +445,48 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
 
     cps_off = await list_message_checkpoints(graph_off, cfg_off)
     cps_on = await list_message_checkpoints(graph_on, cfg_on)
-    shared = [
-        (a, b) for a, b in zip(cps_off, cps_on)
-        if a["agent_id"] == b["agent_id"] and a["position"] == b["position"]
-        and a["snapshot"].values["contexts"][a["agent_id"]][a["position"]]["content"]
-            == b["snapshot"].values["contexts"][b["agent_id"]][b["position"]]["content"]
-    ]
-    if not shared:
-        raise ValueError("No checkpoint is byte-identical between the baseline and checker-on traces -- "
-                          "the checker must have flagged something NOT_HIGH before any shared step.")
-    idx = {"first_agent_message": 0, "last_agent_message": -1}.get(strategy, len(shared) // 2)
-    target_off, target_on = shared[idx]
+    # See the docstring above: cps_off[i]/cps_on[i] are always "the same
+    # point" turn-for-turn, so pairing by index (no content comparison) is
+    # always valid.
+    pairs = list(zip(cps_off, cps_on))
+    if not pairs:
+        raise ValueError("No assistant-turn checkpoints were produced by either run.")
+
+    if experiment_design in ("1", "2"):
+        # Every message gets a Trust_Allocator notice under these designs,
+        # so there is no "before the checker did anything" region to pick
+        # `strategy` over -- the historical experiment for Designs 1/2
+        # always injects at the second eligible checkpoint.
+        if len(pairs) < 2:
+            raise ValueError(
+                f"Design {experiment_design} requires at least 2 assistant-turn checkpoints to inject "
+                f"at the second one, but only {len(pairs)} were produced."
+            )
+        eligible = pairs[:2]
+        idx = 1
+    else:
+        # Designs 3/4: HIGH is transparent, so checker-on only starts
+        # diverging in effect (not necessarily content) from checker-off
+        # at its first non-HIGH Trust_Allocator verdict. gricean_history
+        # is appended to in exactly the same per-turn order
+        # list_message_checkpoints walks checkpoints in (see
+        # gricean_check() in langgraph_debate.py), so its indices line up
+        # 1:1 with `pairs`.
+        gricean_history = no_error_on.get("gricean_history") or []
+        first_non_high = next(
+            (i for i, entry in enumerate(gricean_history)
+             if str(entry.get("level", "")).strip().lower() != "high"),
+            None,
+        )
+        eligible = pairs if first_non_high is None else pairs[:first_non_high]
+        if not eligible:
+            raise ValueError(
+                "The Trust_Allocator's very first verdict was already non-HIGH, leaving no eligible "
+                "checkpoint before it to fork from."
+            )
+        idx = {"first_agent_message": 0, "last_agent_message": -1}.get(strategy, len(eligible) // 2)
+
+    target_off, target_on = eligible[idx]
 
     corruption = generate_corrupted_message(
         debate_config, task, target_off["snapshot"].values["contexts"][target_off["agent_id"]],
