@@ -354,13 +354,37 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
                                       agents_num: int = 3, rounds_num: int = 2, fm_id: Optional[str] = None,
                                       strategy: str = "middle_agent_message",
                                       attachment: Optional[Dict[str, Any]] = None,
-                                      ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                                      experiment_design: str = "4",
+                                      records: Optional[List[Dict[str, Any]]] = None,
+                                      ) -> Dict[str, Any]:
     """Runs the SAME debate twice -- checker off, checker on -- each under
     its own MemorySaver/thread, locates a checkpoint whose (agent_id,
     position) AND content match exactly across both traces (verified, not
     assumed -- see the content equality check below), generates ONE
     corruption there, and forks both graphs from that shared point with
-    the identical corrupted content. Returns (result_off, result_on).
+    the identical corrupted content.
+
+    Returns a dict:
+        {"no_error_off": <full DebateState, checker off, un-forked>,
+         "no_error_on": <full DebateState, checker on, un-forked>,
+         "no_error_call_count": <len(records) right after computing the
+             two states above, or None if `records` wasn't passed in>,
+         "error_off": <result of forking the checker-off run>,
+         "error_on": <result of forking the checker-on run>}
+
+    The two states above are the SAME no-error baseline/trust-enabled
+    pair the fork below branches from -- PART 1 of the instrumentation
+    pass requires these to be preserved (they used to be computed here
+    and then discarded), not recomputed: this function still only ever
+    runs each side's debate to completion once.
+
+    `records` (see gaia_runner/debate_usage.py's patched_call_llm), if
+    passed, lets the caller split the per-call log into "calls made
+    while producing the no-error pair" vs. "calls made producing the
+    corruption + its two forked continuations", so each returned trace's
+    token_stats reflects only the calls that actually belong to it (see
+    "no_error_call_count" above) rather than attaching every call made
+    across the whole experiment to every trace.
 
     `attachment` (shape of gaia_utils.load_attachment()'s return value) is
     passed to BOTH graphs via the shared `base` dict below, not loaded or
@@ -377,17 +401,29 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     and this function would always raise the "no checkpoint is
     byte-identical" error below. Do not load or construct the attachment
     separately for graph_off vs. graph_on.
+
+    `experiment_design` (see repo-root experiment_design.py) is threaded
+    into BOTH graph_off's and graph_on's initial state unchanged -- the
+    same selected design must survive the fork, since it's what
+    langgraph_debate.gricean_check() / construct_broadcast() key off of
+    on each side. It also gets folded into each side's thread_id so
+    traces from different designs never collide in the same MemorySaver.
     """
     saver_off, saver_on = MemorySaver(), MemorySaver()
     graph_off, graph_on = build_graph(saver_off), build_graph(saver_on)
-    cfg_off = {"configurable": {"thread_id": "baseline"}, "recursion_limit": 300}
-    cfg_on = {"configurable": {"thread_id": "gricean"}, "recursion_limit": 300}
+    cfg_off = {"configurable": {"thread_id": f"baseline-design{experiment_design}"}, "recursion_limit": 300}
+    cfg_on = {"configurable": {"thread_id": f"gricean-design{experiment_design}"}, "recursion_limit": 300}
     base = {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
             "contexts": [], "adherence": {}, "gricean_history": [], "reflections": {}, "final_answer": None,
-            "config": debate_config, "attachment": attachment}
+            "config": debate_config, "attachment": attachment, "experiment_design": experiment_design}
 
-    await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
-    await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
+    no_error_off = await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
+    no_error_on = await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
+    # Boundary between "calls that belong to the no-error pair" and
+    # "calls that belong to the corruption + its forked continuations"
+    # below -- captured here, before generate_corrupted_message or either
+    # fork_trace_with_error call appends anything further.
+    no_error_call_count = len(records) if records is not None else None
 
     cps_off = await list_message_checkpoints(graph_off, cfg_off)
     cps_on = await list_message_checkpoints(graph_on, cfg_on)
@@ -409,4 +445,10 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     )
     result_off = await fork_trace_with_error(graph_off, debate_config, task, target_off, error_type, fm_id, corruption)
     result_on = await fork_trace_with_error(graph_on, debate_config, task, target_on, error_type, fm_id, corruption)
-    return result_off, result_on
+    return {
+        "no_error_off": no_error_off,
+        "no_error_on": no_error_on,
+        "no_error_call_count": no_error_call_count,
+        "error_off": result_off,
+        "error_on": result_on,
+    }

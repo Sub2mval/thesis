@@ -39,7 +39,23 @@
 # to get "FINAL ANSWER: ..." lines that extract_gaia_answer/
 # gaia_question_scorer can consume). Neither is imported here so this file
 # has no hard GAIA dependency.
+#
+# Experiment-design / Trust_Allocator extension (see repo-root
+# experiment_design.py): state["experiment_design"] (default "4", set by
+# run_debate) picks which experiment design gricean_check() below scores
+# every turn under. Designs "1", "2", "3", and "4" ALL short-circuit to
+# the canonical Trust_Allocator (trust_allocator.legacy_trust_allocator.
+# allocate), resolved via experiment_design.resolve_design() -- the old
+# 4-axis Gricean checker above is no longer dispatched to for any of
+# these designs (the Gricean_check.py module/functions are left in place
+# for unrelated legacy compatibility, but nothing here calls them anymore).
+# construct_broadcast wraps each flagged agent's broadcast content with
+# that agent's trust notice (trust_allocator.legacy_trust_allocator.
+# wrap_with_trust_notice); for designs whose resolved policy also has
+# reflect=True (Design 4's medium/low verdicts), that agent is additionally
+# added to `flagged` so agent_turn triggers one private reflection call.
 
+import asyncio
 import json
 import random
 import re
@@ -56,6 +72,12 @@ from .Gricean_check import (
     format_conversation,
     format_gricean_check_prompt,
     score_to_gricean_level,
+)
+from experiment_design import resolve_design
+from trust_allocator.legacy_trust_allocator import (
+    TRUST_ALLOCATOR_NODE_NAME,
+    allocate as allocate_trust,
+    wrap_with_trust_notice,
 )
 
 Message = Dict[str, Any]  # role/content, plus optionally images/audio for attachments
@@ -106,14 +128,22 @@ def parse_gricean_scores(text: str) -> Dict[str, Dict[str, Any]]:
 
 
 def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, round_idx: int,
-                         adherence: Dict[int, Dict[str, str]]) -> Tuple[Message, List[Tuple[int, str, str]]]:
+                         adherence: Dict[int, Dict[str, str]],
+                         design: str = "4") -> Tuple[Message, List[Tuple[int, str, str]]]:
     """Returns (broadcast_message, flagged) where flagged lists the
-    (agent_id, raw_content, checker_reason) triples for NOT_HIGH sources
-    this round -- used by the caller to decide whether to reflect. The
-    delivered content itself is never altered by the checker's verdict
-    (matching magnetic_one's Gricean_Checker, which never touches
-    MessageHistory) -- a flagged message only ever reaches the receiving
-    agent through the private reflection call in agent_turn."""
+    (agent_id, raw_content, checker_reason) triples the caller should
+    trigger a private reflection call for -- used by the caller to decide
+    whether to reflect.
+
+    All of designs 1-4 go through the Trust_Allocator here: each agent's
+    `adherence` entry carries {"trust_level", "reason", "notice",
+    "reflect"} (see gricean_check() below / experiment_design.
+    resolve_design()). Every agent whose resolved policy has a `notice`
+    gets that trust notice prepended to ITS content in the broadcast text
+    itself, per that design's notice policy. `flagged` is populated only
+    for entries whose policy says reflect=True -- never true under
+    Designs 1-3 (always reflect=False), but true for a medium/low verdict
+    under Design 4."""
     if not others:
         return {"role": "user", "content": "Please verify and restate your answer clearly at the end."}, []
     parts = ["Other agents' current answers:"]
@@ -121,9 +151,12 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
     for agent_id, ctx in others:
         content = ctx[round_idx]["content"]
         info = adherence.get(agent_id)
-        parts.append(f"\nAgent {agent_id + 1}: ```{content}```")
-        if info and info["level"] == "not_high":
-            flagged.append((agent_id, content, info["reason"]))
+        delivered = content
+        if info and info.get("notice"):
+            delivered = wrap_with_trust_notice(content, info["notice"])
+        parts.append(f"\nAgent {agent_id + 1}: ```{delivered}```")
+        if info and info.get("reflect"):
+            flagged.append((agent_id, content, info.get("reason", "")))
     parts.append(f"\n\nUsing this as advice, give an updated answer to: {question}\n"
                   "State your final answer clearly at the end.")
     return {"role": "user", "content": "\n".join(parts)}, flagged
@@ -131,12 +164,12 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
 
 def _reflection_prompt(query: str, flagged: List[Tuple[int, str, str]]) -> str:
     blocks = "\n\n".join(
-        f"Flagged message from Agent {aid + 1}:\n```{content}```\nGricean adherence checker's reasoning: {reason}"
+        f"Flagged message from Agent {aid + 1}:\n```{content}```\nTrust_Allocator's reason for the LOW-trust verdict: {reason}"
         for aid, content, reason in flagged
     )
     return (
-        "Before answering, privately reflect on the message(s) below, which the Gricean adherence "
-        "checker flagged as NOT high adherence. This reflection is private: it will not be shown to "
+        "Before answering, privately reflect on the message(s) below, which the Trust_Allocator "
+        "flagged as LOW trust. This reflection is private: it will not be shown to "
         "any other agent, and it will not be available to you in future turns.\n"
         f"Task: {query}\n\n{blocks}\n\n"
         "Write a brief reflection: how much should you rely on this information, and what specifically "
@@ -164,6 +197,12 @@ class DebateState(TypedDict):
     config: Dict[str, Any]
     use_gricean_check: bool
     attachment: Optional[Dict[str, Any]]  # shape of gaia_utils.load_attachment()'s return value
+    # Experiment-design / Trust_Allocator extension (see repo-root
+    # experiment_design.py and the module docstring above). "4" (the
+    # default) preserves the pre-existing Gricean-checker behavior above
+    # completely unchanged; set once by run_debate, never mutated by any
+    # node.
+    experiment_design: str
 
 
 def _build_initial_message(query: str, attachment: Optional[Dict[str, Any]]) -> Message:
@@ -194,14 +233,21 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
     flagged: List[Tuple[int, str, str]] = []
     if r != 0:
         others = [(j, contexts[j]) for j in range(state["agents_num"]) if j != i]
+        design = state.get("experiment_design", "4")
         # Adherence history is always collected (see gricean_check below,
         # which now runs unconditionally) so it's available for analysis
-        # either way -- but it's only surfaced to the agents (notices,
-        # reflection) when use_gricean_check is on. Passing {} here makes
+        # either way. It's only ever surfaced to the agents (notices,
+        # reflection) when use_gricean_check is on -- passing {} makes
         # construct_broadcast treat every source as unassessed, i.e. plain
-        # pass-through with no flagging, exactly like the checker were off.
+        # pass-through with no flagging, exactly matching a baseline run
+        # with the checker off. This holds for design "4" and for designs
+        # 1-3 alike: use_gricean_check is the intervention switch, and a
+        # baseline run (use_gricean_check=False) must receive the raw
+        # broadcast with no trust notice and no reflection regardless of
+        # which design is selected -- see gricean_checker.py's baseline
+        # branch in magnetic_one for the matching enforcement there.
         visible_adherence = state["adherence"] if state["use_gricean_check"] else {}
-        broadcast, flagged = construct_broadcast(others, state["query"], 2 * r - 1, visible_adherence)
+        broadcast, flagged = construct_broadcast(others, state["query"], 2 * r - 1, visible_adherence, design)
         contexts[i].append(broadcast)
 
     reflections = {k: list(v) for k, v in state["reflections"].items()}
@@ -228,30 +274,75 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
             "reflections": reflections}
 
 
+def _debate_client_for_allocator(config: Dict[str, Any]):
+    """Adapt langgraph_debate's own call_llm() into the sync
+    ClientCallable shape trust_allocator.legacy_trust_allocator.allocate
+    expects (prompt string -> raw response string)."""
+
+    def _client(prompt: str) -> str:
+        return call_llm([{"role": "user", "content": prompt}], config, call_type="trust_allocator")
+
+    return _client
+
+
+async def _trust_allocator_check(state: DebateState, speaker: int, ctx: List[Message], msg_round: int) -> Dict[str, Any]:
+    """Design 1-3 branch of gricean_check: score the last message with
+    the canonical Trust_Allocator instead of the Gricean 4-axis checker,
+    then resolve the verdict via experiment_design.resolve_design().
+    Designs 1, 2, and 3 are implemented (see experiment_design.py). Only
+    called when use_gricean_check is on -- see the baseline short-circuit
+    in gricean_check() below."""
+    design = state["experiment_design"]
+    conversation = format_conversation([{"source": m["role"], "content": m["content"]} for m in ctx])
+    verdict = await allocate_trust(
+        state["query"], conversation, f"Agent {speaker + 1}", _debate_client_for_allocator(state["config"])
+    )
+    raw_trust_level = verdict["trust_level"]
+    reason = verdict["reason"]
+    policy = resolve_design(raw_trust_level, design)
+
+    adherence = dict(state["adherence"])
+    adherence[speaker] = {
+        "trust_level": raw_trust_level, "reason": reason,
+        "notice": policy["notice"], "reflect": policy["reflect"],
+    }
+    gricean_history = list(state["gricean_history"])
+    gricean_history.append({
+        "round": msg_round, "agent_id": speaker, "level": raw_trust_level, "reason": reason,
+        "scores": None,  # the Trust_Allocator has no per-axis scores, unlike the Gricean checker
+        "experiment_design": design, "notice_applied": policy["notice"], "reflect": policy["reflect"],
+    })
+    return {"adherence": adherence, "gricean_history": gricean_history}
+
+
 def gricean_check(state: DebateState) -> Dict[str, Any]:
     # Runs on every turn regardless of use_gricean_check, so adherence
     # history is always collected for analysis. Whether it's actually
     # shown to the agents is decided downstream, in agent_turn.
     speaker = (state["agent_idx"] - 1) % state["agents_num"]
     ctx = state["contexts"][speaker]
-    conversation = format_conversation([{"source": m["role"], "content": m["content"]} for m in ctx])
-    prompt = format_gricean_check_prompt(state["query"], conversation, f"Agent {speaker + 1}")
-    scores = parse_gricean_scores(call_llm([{"role": "user", "content": prompt}], state["config"], call_type="gricean_check"))
-    level = score_to_gricean_level({m: scores[m]["score"] for m in GRICEAN_METRICS})
-    reason = format_combined_reason(scores)
-    adherence = dict(state["adherence"])
-    adherence[speaker] = {"level": level, "reason": reason}
     # agent_turn already advanced state["round"] to round+1 by the time this
     # node runs, but only when `speaker` was the last agent in that round
     # (next_i wrapped to 0) -- undo that so the logged round matches the
     # round the checked message actually belongs to.
     msg_round = state["round"] - 1 if speaker == state["agents_num"] - 1 else state["round"]
-    gricean_history = list(state["gricean_history"])
-    gricean_history.append({
-        "round": msg_round, "agent_id": speaker, "level": level, "reason": reason,
-        "scores": {m: scores[m]["score"] for m in GRICEAN_METRICS},
-    })
-    return {"adherence": adherence, "gricean_history": gricean_history}
+
+    # Designs 1-4 all route through the canonical Trust_Allocator +
+    # experiment_design.resolve_design(); the old 4-axis Gricean scoring
+    # path below is no longer dispatched to for any of them (see the
+    # module docstring above).
+    design = state.get("experiment_design", "4")
+    if not state.get("use_gricean_check", False):
+        # Baseline: use_gricean_check is the intervention switch for
+        # Trust_Allocator designs. Do NOT call the canonical
+        # Trust_Allocator on a baseline run -- just clear any
+        # transient per-speaker intervention state left over from a
+        # prior turn and continue. gricean_history is intentionally
+        # left untouched (no entry logged for this baseline turn).
+        adherence = dict(state["adherence"])
+        adherence.pop(speaker, None)
+        return {"adherence": adherence}
+    return asyncio.run(_trust_allocator_check(state, speaker, ctx, msg_round))
 
 
 def aggregate(state: DebateState) -> Dict[str, Any]:
@@ -289,15 +380,23 @@ def build_graph(checkpointer=None):
 
 
 def run_debate(query: str, config: Dict[str, Any], agents_num: int = 3, rounds_num: int = 2,
-               use_gricean_check: bool = False, attachment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+               use_gricean_check: bool = False, attachment: Optional[Dict[str, Any]] = None,
+               experiment_design: str = "4") -> Dict[str, Any]:
     """Returns the full final DebateState (contexts/adherence/reflections/
     final_answer/etc), not just the answer string -- callers that only
-    want the answer should read result["final_answer"]."""
+    want the answer should read result["final_answer"].
+
+    experiment_design: "4" (the default) preserves the pre-existing
+    Gricean-checker behavior above completely unchanged; "1" routes
+    every turn's adherence check through the canonical Trust_Allocator
+    instead (see gricean_check() / experiment_design.resolve_design()).
+    """
     app = build_graph()
     result = app.invoke(
         {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
          "contexts": [], "adherence": {}, "gricean_history": [], "reflections": {}, "final_answer": None,
-         "config": config, "use_gricean_check": use_gricean_check, "attachment": attachment},
+         "config": config, "use_gricean_check": use_gricean_check, "attachment": attachment,
+         "experiment_design": experiment_design},
         config={"recursion_limit": 300},
     )
     return result

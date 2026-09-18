@@ -28,7 +28,9 @@ from typing import Any, Dict, List
 
 def summarize_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Builds the trace-level totals from a list of per-call records
-    already in the CallRecord shape above (see debate_usage.py)."""
+    already in the CallRecord shape above (see debate_usage.py). Every
+    raw per-call record is preserved verbatim in `calls` -- aggregation
+    never discards the per-attempt records it's computed from (PART 11)."""
     prompt_tokens = sum(c.get("prompt_tokens") or 0 for c in calls)
     completion_tokens = sum(c.get("completion_tokens") or 0 for c in calls)
     return {
@@ -38,5 +40,6 @@ def summarize_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "total_elapsed_seconds": sum(c.get("elapsed_seconds") or 0 for c in calls),
         "calls": calls,
     }

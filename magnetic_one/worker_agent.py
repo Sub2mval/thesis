@@ -4,8 +4,10 @@ Worker agent nodes -- FileSurfer / WebSurfer / Coder / ComputerTerminal
 `agent_callers` (the dict AutoGen ChatAgents are adapted into by
 context_utils.make_autogen_agent_caller). Every worker node does the same
 three things: read the instruction just handed to it (with any pending
-Gricean reflection folded in), call the agent, and append its response to
-MessageHistory.
+Gricean reflection folded in, and/or an experiment-design trust notice
+wrapped around it -- see state["pending_trust_level"], set by
+gricean_checker.py's Design 1-3 branch), call the agent, and append its
+response to MessageHistory.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from autogen_core import CancellationToken
 from magnetic_one.context_utils import ORCHESTRATOR_NAME, AgentCaller
 from magnetic_one.json_llm import truncate_message_content
 from magnetic_one.state import MagenticState
+from trust_allocator.legacy_trust_allocator import wrap_with_trust_notice
 
 
 def build_worker_nodes(agent_callers: Dict[str, AgentCaller]) -> Dict[str, Any]:
@@ -25,6 +28,9 @@ def build_worker_nodes(agent_callers: Dict[str, AgentCaller]) -> Dict[str, Any]:
             instruction = state["instruction"]
             if state.get("pending_reflection"):
                 instruction = f"{state['pending_reflection']}\n\n{instruction}"
+            # No-op when pending_trust_level is None/"undefined" (design 4,
+            # or a design-1-3 turn whose policy called for no notice).
+            instruction = wrap_with_trust_notice(instruction, state.get("pending_trust_level"))
             content = truncate_message_content(await caller(instruction, CancellationToken()))
             new_messages = list(state["messages"]) + [{"source": name, "content": content}]
             return {**state, "messages": new_messages, "next_after_check": ORCHESTRATOR_NAME}

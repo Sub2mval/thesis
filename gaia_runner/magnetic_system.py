@@ -118,6 +118,7 @@ def _combined_usage(magentic: MagenticOneLangGraph) -> Dict[str, Any]:
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "total_elapsed_seconds": sum(c.get("elapsed_seconds") or 0 for c in calls),
         "calls": calls,
     }
 
@@ -140,6 +141,7 @@ def _build_trace(
     corrupted_message: Optional[Dict[str, Any]] = None,
     target_source: Optional[str] = None,
     started_at: Optional[str] = None,
+    experiment_design: str = "4",
 ) -> Dict[str, Any]:
     """Builds one trace dict, shaped to match this project's established
     magnetic_one trace schema (task_id/question/ground_truth/level/graph/
@@ -163,6 +165,7 @@ def _build_trace(
         "temperature": DEFAULT_TEMPERATURE, "seed": DEFAULT_SEED,
         "use_gricean_check": use_gricean_check, "fork_condition": fork_condition,
         "error_type": error_type, "fm_id": fm_id, "fm_name": fm_name,
+        "experiment_design": experiment_design,
         "final_answer_raw": answer, "final_answer_extracted": extracted, "correct": correct,
         "messages": final_state.get("messages"),
         "trust_history": trust_history, "trust_scores": trust_history[-1]["scores"] if trust_history else None,
@@ -186,14 +189,24 @@ def _build_trace(
     return trace
 
 
-def run_magnetic_baseline(question: Dict[str, Any], magentic: MagenticOneLangGraph, use_gricean_check: bool) -> Dict[str, Any]:
-    """Runs one GAIA question through magnetic_one once (checker on or off)."""
-    tid = f"{question['task_id']}::magnetic_one::{'checked' if use_gricean_check else 'clean'}"
+def run_magnetic_baseline(
+    question: Dict[str, Any], magentic: MagenticOneLangGraph, use_gricean_check: bool, experiment_design: str = "4"
+) -> Dict[str, Any]:
+    """Runs one GAIA question through magnetic_one once (checker on or
+    off). experiment_design: "4" (default) preserves the pre-existing
+    Gricean-checker behavior; "1" routes through the canonical
+    Trust_Allocator instead (see magnetic_one/gricean_checker.py)."""
+    tid = f"{question['task_id']}::magnetic_one::{'checked' if use_gricean_check else 'clean'}::design{experiment_design}"
     started_at = _now_iso()
-    result = asyncio.run(magentic.run(_task_text(question), thread_id=tid, enable_gricean_check=use_gricean_check))
+    result = asyncio.run(
+        magentic.run(
+            _task_text(question), thread_id=tid, enable_gricean_check=use_gricean_check,
+            experiment_design=experiment_design,
+        )
+    )
     return _build_trace(
         question, result, result["token_stats"], thread_id=tid, use_gricean_check=use_gricean_check,
-        started_at=started_at,
+        started_at=started_at, experiment_design=experiment_design,
     )
 
 
@@ -202,16 +215,55 @@ def run_magnetic_error_forks(
     magentic: MagenticOneLangGraph,
     error_plan: List[Tuple[str, Optional[str]]],
     strategy: str = "middle_agent_message",
-) -> List[Dict[str, Any]]:
+    experiment_design: str = "4",
+) -> Dict[str, List[Dict[str, Any]]]:
     """Runs the baseline pair once, then one fork per (error_type, fm_id)
     in `error_plan`, all forked from that same shared pair (see
     paired_fork.py's docstring for why this stays comparable up to the
     injection point -- verdict-based, not byte-identical, as of the
-    shared_prefix_length fix). Returns a flat list of two trace dicts
-    (checker_off, checker_on) per fork."""
+    shared_prefix_length fix).
+
+    Returns {"baseline_traces": [...], "fork_traces": [...]}:
+      - "fork_traces": two trace dicts (checker_off, checker_on) per fork,
+        as before.
+      - "baseline_traces": the no-error baseline/gricean-checked pair that
+        run_paired_traces computes before any fork exists (pair[
+        "baseline_result"]/pair["gricean_result"]) -- previously computed
+        and then only used as a fork starting point, never saved as its
+        own trace. Now preserved once, here, NOT recomputed (PART 1 of
+        the instrumentation pass): every design/system combination needs
+        exactly baseline+no-error, Trust_Allocator+no-error, baseline+
+        FM-1.1, Trust_Allocator+FM-1.1 -- four traces total. Each side's
+        own `result["token_stats"]` is already correctly scoped to just
+        that side's calls -- magentic.run() resets usage tracking at its
+        own start (see magnetic_one_langgraph.py), so gricean_result's
+        run does not bleed baseline_result's calls into its own stats,
+        and both were captured into their respective result dicts before
+        the per-fork reset_usage_tracking() calls below ever run.
+
+    experiment_design (see repo-root experiment_design.py) is passed
+    straight through to run_paired_traces, which threads it into both
+    sides of the baseline pair, and is recorded on every resulting
+    trace (via _build_trace) and folded into each trace's thread_id so
+    traces from different designs never collide."""
     task = _task_text(question)
-    pair = asyncio.run(run_paired_traces(magentic, task, thread_id_prefix=question["task_id"]))
-    results: List[Dict[str, Any]] = []
+    pair_started_at = _now_iso()
+    pair = asyncio.run(run_paired_traces(
+        magentic, task, thread_id_prefix=question["task_id"], experiment_design=experiment_design,
+    ))
+    baseline_traces: List[Dict[str, Any]] = [
+        _build_trace(
+            question, result, result["token_stats"],
+            thread_id=f"{question['task_id']}::magnetic_one::"
+                      f"{'checked' if use_gricean_check else 'clean'}::design{experiment_design}",
+            use_gricean_check=use_gricean_check, started_at=pair_started_at, experiment_design=experiment_design,
+        )
+        for use_gricean_check, result in (
+            (False, pair["baseline_result"]), (True, pair["gricean_result"])
+        )
+    ]
+
+    fork_traces: List[Dict[str, Any]] = []
     for error_type, fm_id in error_plan:
         reset_usage_tracking(magentic.client)
         if magentic.gricean_model_client is not magentic.client:
@@ -225,16 +277,16 @@ def run_magnetic_error_forks(
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
             side_result = fork[side]
             final_state = side_result["final_state"]
-            results.append(_build_trace(
+            fork_traces.append(_build_trace(
                 question, final_state, stats,
-                thread_id=f"{question['task_id']}::magnetic_one::{label}",
+                thread_id=f"{question['task_id']}::magnetic_one::{label}::design{experiment_design}",
                 fork_condition=label, error_type=fork["error_type"], fm_id=fork["fm_id"], fm_name=fork["fm_name"],
                 injected_at_message_index=fork["injected_at_message_index"],
                 injected_at_step=side_result.get("injected_at_step"), injected_at_node=side_result.get("injected_at_node"),
                 original_message=side_result.get("original_message"), corrupted_message=fork["corrupted_message"],
-                started_at=started_at,
+                started_at=started_at, experiment_design=experiment_design,
             ))
-    return results
+    return {"baseline_traces": baseline_traces, "fork_traces": fork_traces}
 
 
 def run_magnetic_error_forks_by_source(

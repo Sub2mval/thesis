@@ -126,6 +126,7 @@ def _build_trace(
     original_message: Optional[Dict[str, Any]] = None,
     corrupted_message: Optional[Dict[str, Any]] = None,
     started_at: Optional[str] = None,
+    experiment_design: str = "4",
 ) -> Dict[str, Any]:
     answer = final_state.get("final_answer") or ""
     extracted, correct = _score(answer, question.get("ground_truth"))
@@ -141,6 +142,7 @@ def _build_trace(
         "temperature": temperature, "seed": seed,
         "use_gricean_check": use_gricean_check, "fork_condition": fork_condition,
         "error_type": error_type, "fm_id": fm_id, "fm_name": fm_name,
+        "experiment_design": experiment_design,
         "final_answer_raw": answer, "final_answer_extracted": extracted, "correct": correct,
         "messages": messages,
         "trust_history": trust_history, "trust_scores": trust_history[-1]["scores"] if trust_history else None,
@@ -172,22 +174,29 @@ def run_debate_baseline(
     use_gricean_check: bool,
     agents_num: int = 3,
     rounds_num: int = 2,
+    experiment_design: str = "4",
 ) -> Dict[str, Any]:
     """Runs one GAIA question through the debate MAS once (checker on or
-    off). Returns a self-contained trace: answer, GAIA score, tokens."""
+    off). Returns a self-contained trace: answer, GAIA score, tokens.
+
+    experiment_design: "4" (default) preserves the pre-existing
+    Gricean-checker behavior; "1" routes through the canonical
+    Trust_Allocator instead (see llm_debate/langgraph_debate.py)."""
     attachment = gaia_utils.load_attachment(question["file_path"]) if question.get("file_path") else None
     cfg = {**debate_config, "answer_format_instruction": gaia_utils.GAIA_ANSWER_FORMAT_INSTRUCTION}
-    tid = f"{question['task_id']}::llm_debate::{'checked' if use_gricean_check else 'clean'}"
+    tid = f"{question['task_id']}::llm_debate::{'checked' if use_gricean_check else 'clean'}::design{experiment_design}"
     started_at = trace_io.now_iso()
     records: List[Dict[str, Any]] = []
     with patched_call_llm(records):
         result = run_debate(question["query"], cfg, agents_num=agents_num, rounds_num=rounds_num,
-                             use_gricean_check=use_gricean_check, attachment=attachment)
+                             use_gricean_check=use_gricean_check, attachment=attachment,
+                             experiment_design=experiment_design)
     return _build_trace(
         question, result, token_usage.summarize_calls(records),
         agents_num=agents_num, rounds_num=rounds_num,
         temperature=debate_config.get("temperature"), seed=debate_config.get("seed"),
         thread_id=tid, use_gricean_check=use_gricean_check, started_at=started_at,
+        experiment_design=experiment_design,
     )
 
 
@@ -198,11 +207,32 @@ def run_debate_error_forks(
     agents_num: int = 3,
     rounds_num: int = 2,
     strategy: str = "middle_agent_message",
-) -> List[Dict[str, Any]]:
+    experiment_design: str = "4",
+) -> Dict[str, List[Dict[str, Any]]]:
     """Runs one paired (checker-off vs. checker-on) fork experiment per
     (error_type, fm_id) in `error_plan` (see error_spec.resolve_error_plan),
-    each pair sharing one identical corrupted message. Returns a flat list
-    of two trace dicts (checker_off, checker_on) per fork.
+    each pair sharing one identical corrupted message.
+
+    Returns {"baseline_traces": [...], "fork_traces": [...]}:
+      - "fork_traces": two trace dicts (checker_off, checker_on) per fork,
+        as before.
+      - "baseline_traces": the no-error checker-off/checker-on pair that
+        run_paired_fork_experiment computes before it ever forks anything
+        -- previously computed and then discarded; now preserved (PART 1
+        of the instrumentation pass: every design/system combination
+        must keep exactly baseline+no-error, Trust_Allocator+no-error,
+        baseline+FM-1.1, Trust_Allocator+FM-1.1 -- four traces total).
+        The paired baseline/trust experiment is NOT rerun separately to
+        produce these -- they're read straight off the same
+        run_paired_fork_experiment call that also produces the error
+        forks below.
+
+    Each fork iteration recomputes its own no-error pair (since
+    run_paired_fork_experiment reruns the whole debate from scratch each
+    call) and so appends its own baseline_traces entries; trace_io's
+    file-naming (task_id/system/condition only, no error-type suffix)
+    means a later, mechanistically-equivalent baseline pair simply
+    overwrites the same two files rather than accumulating duplicates.
 
     The attachment (if any) is loaded once, here, and passed into every
     run_paired_fork_experiment call below -- the same object each time.
@@ -216,37 +246,70 @@ def run_debate_error_forks(
     that would still be functionally fine (load_attachment is a pure
     function of the file path) but breaks the "one canonical attachment
     object per question" invariant this function is written to preserve.
+
+    experiment_design: "4" (default) preserves the pre-existing
+    Gricean-checker behavior; "1"/"2"/"3" route through the canonical
+    Trust_Allocator instead (see llm_debate/langgraph_debate.py). Passed
+    straight through to run_paired_fork_experiment, which threads it into
+    both the checker-off and checker-on graph state so the same selected
+    design survives the fork, and is also folded into each trace's
+    thread_id so traces from different designs don't collide.
     """
     attachment = gaia_utils.load_attachment(question["file_path"]) if question.get("file_path") else None
     cfg = {**debate_config, "answer_format_instruction": gaia_utils.GAIA_ANSWER_FORMAT_INSTRUCTION}
-    results: List[Dict[str, Any]] = []
+    baseline_traces: List[Dict[str, Any]] = []
+    fork_traces: List[Dict[str, Any]] = []
     for error_type, fm_id in error_plan:
         started_at = trace_io.now_iso()
         records: List[Dict[str, Any]] = []
         with patched_call_llm(records):
-            result_off, result_on = asyncio.run(run_paired_fork_experiment(
+            pair_result = asyncio.run(run_paired_fork_experiment(
                 question["query"], cfg, question["query"], error_type, agents_num=agents_num,
                 rounds_num=rounds_num, fm_id=fm_id, strategy=strategy, attachment=attachment,
+                experiment_design=experiment_design, records=records,
             ))
-        # Token usage covers both sides of this fork (they share one
-        # baseline pass before diverging at the injection point), so the
-        # same combined stats are attached to both result rows.
-        stats = token_usage.summarize_calls(records)
-        for label, result in (("checker_off", result_off), ("checker_on", result_on)):
+        # Calls made producing the no-error pair vs. calls made producing
+        # the corruption + its two forked continuations are split at this
+        # boundary (see run_paired_fork_experiment's docstring), so each
+        # trace's token_stats reflects only the calls that actually
+        # belong to it rather than every call made across this whole
+        # fork iteration.
+        no_error_boundary = pair_result["no_error_call_count"] or 0
+        no_error_stats = token_usage.summarize_calls(records[:no_error_boundary])
+        # Fork traces keep the prior "combined" behavior (both sides of
+        # one fork share stats, since they fork from one shared prefix):
+        # here that's every call from the corruption onward.
+        fork_stats = token_usage.summarize_calls(records[no_error_boundary:])
+
+        for use_gricean_check, no_error_state in (
+            (False, pair_result["no_error_off"]), (True, pair_result["no_error_on"])
+        ):
+            baseline_traces.append(_build_trace(
+                question, no_error_state, no_error_stats,
+                agents_num=agents_num, rounds_num=rounds_num,
+                temperature=debate_config.get("temperature"), seed=debate_config.get("seed"),
+                thread_id=f"{question['task_id']}::llm_debate::"
+                          f"{'checked' if use_gricean_check else 'clean'}::design{experiment_design}",
+                use_gricean_check=use_gricean_check, started_at=started_at,
+                experiment_design=experiment_design,
+            ))
+
+        for label, result in (("checker_off", pair_result["error_off"]), ("checker_on", pair_result["error_on"])):
             final_state = result["final_state"]
             agent_id, position = result["injected_at_agent_id"], result["injected_at_position"]
             msg_idx = _round_of_position(final_state["contexts"], agent_id, position) * agents_num + agent_id
             original = {"source": f"Agent{agent_id + 1}", "content": result["original_message"]}
             corrupted = {"source": f"Agent{agent_id + 1}", "content": result["corrupted_message"]}
-            results.append(_build_trace(
-                question, final_state, stats,
+            fork_traces.append(_build_trace(
+                question, final_state, fork_stats,
                 agents_num=agents_num, rounds_num=rounds_num,
                 temperature=debate_config.get("temperature"), seed=debate_config.get("seed"),
-                thread_id=f"{question['task_id']}::llm_debate::{label}",
+                thread_id=f"{question['task_id']}::llm_debate::{label}::design{experiment_design}",
                 fork_condition=label, error_type=result["error_type"], fm_id=result["fm_id"],
                 fm_name=result["fm_name"], injected_at_message_index=msg_idx,
                 injected_at_step=result["injected_at_step"], injected_at_agent_id=agent_id,
                 injected_at_position=position, injected_at_node=result["injected_at_node"],
                 original_message=original, corrupted_message=corrupted, started_at=started_at,
+                experiment_design=experiment_design,
             ))
-    return results
+    return {"baseline_traces": baseline_traces, "fork_traces": fork_traces}

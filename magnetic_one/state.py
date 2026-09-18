@@ -129,3 +129,20 @@ class MagenticState(TypedDict, total=False):
     # Orchestrator -> worker) and needs to know who should receive the
     # message it just checked, so it can route there once it's done.
     next_after_check: str
+
+    # --- Experiment-design / Trust_Allocator extension ---
+    # Which historical design (see repo-root experiment_design.py) the
+    # checker node should run under. Designs "1", "2", "3", and "4" (the
+    # default) all route through trust_allocator.legacy_trust_allocator +
+    # resolve_design(); the old inline Gricean adherence-check scoring is
+    # no longer dispatched to for any of them. Set once at run start (see
+    # magnetic_one_langgraph.py); the checker node itself never mutates it.
+    experiment_design: str
+    # Set by Gricean_Checker: the notice key (from resolve_design()'s
+    # policy) that should be attached as a delivery-time trust notice to
+    # the next hand-off, or None when this turn's design/policy calls for
+    # no notice. Consumed once by whichever node runs next
+    # (orchestrator_agent.py / worker_agent.py), exactly like
+    # pending_reflection -- never re-read on a later turn, and never used
+    # to mutate the stored `messages` transcript itself.
+    pending_trust_level: "Optional[str]"

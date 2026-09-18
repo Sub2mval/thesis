@@ -94,6 +94,7 @@ async def call_model_for_json(
     validate: Validator,
     source: str,
     max_retries: int = MAX_JSON_RETRIES,
+    call_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Call `model_client` on `base_context`, parse the response as a
     single JSON object, and pass it through `validate`. On a parse failure
@@ -122,10 +123,14 @@ async def call_model_for_json(
             context = base_context
 
         compatible = get_compatible_context(model_client, context)
+        # call_type is an instrumentation-only label (PART 11); passed
+        # through extra_create_args, which the instrumented client pops
+        # before forwarding the rest on to the real API.
+        extra_create_args = {"call_type": call_type} if call_type else None
         if model_client.model_info.get("json_output", False):
-            response = await model_client.create(compatible, json_output=True)
+            response = await model_client.create(compatible, json_output=True, extra_create_args=extra_create_args)
         else:
-            response = await model_client.create(compatible)
+            response = await model_client.create(compatible, extra_create_args=extra_create_args)
         raw = response.content
 
         try:

@@ -135,18 +135,32 @@ def _merge_options(
     return merged or None
 
 
+def _mask_key(key: str, index: int) -> str:
+    """Non-secret identifier for a rotating key -- NEVER the full key
+    (PART 14): provider/host/key-index/last-four-characters only."""
+    return f"key#{index} (...{key[-4:]})" if len(key) >= 4 else f"key#{index}"
+
+
 def _build_client_for_key(
     model: str,
     host: str,
     key: str,
     model_info: Optional[dict],
     options: Optional[Dict[str, Any]],
+    key_index: int = 0,
 ) -> ChatCompletionClient:
+    key_identifier = _mask_key(key, key_index)
     with _temporarily_set_env("OLLAMA_API_KEY", key):
         try:
             if model_info is not None:
-                return InstrumentedOllamaChatCompletionClient(OllamaChatCompletionClient(model=model, host=host, model_info=model_info, options=options))
-            return InstrumentedOllamaChatCompletionClient(OllamaChatCompletionClient(model=model, host=host, options=options))
+                return InstrumentedOllamaChatCompletionClient(
+                    OllamaChatCompletionClient(model=model, host=host, model_info=model_info, options=options),
+                    model=model, host=host, key_identifier=key_identifier, generation_options=options,
+                )
+            return InstrumentedOllamaChatCompletionClient(
+                OllamaChatCompletionClient(model=model, host=host, options=options),
+                model=model, host=host, key_identifier=key_identifier, generation_options=options,
+            )
         except ValueError as e:
             if "model_info is required" not in str(e):
                 raise
@@ -185,8 +199,8 @@ class RotatingKeyOllamaClient:
         self._keys = list(api_keys)
         merged_options = _merge_options(temperature, seed, options)
         self._clients: List[ChatCompletionClient] = [
-            _build_client_for_key(model=model, host=host, key=key, model_info=model_info, options=merged_options)
-            for key in self._keys
+            _build_client_for_key(model=model, host=host, key=key, model_info=model_info, options=merged_options, key_index=idx)
+            for idx, key in enumerate(self._keys)
         ]
         self._idx = 0
         self._base_backoff = base_backoff_seconds
@@ -322,6 +336,7 @@ class RotatingKeyOllamaClient:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "total_elapsed_seconds": sum(r.get("elapsed_seconds") or 0 for r in records),
             "calls": records,
         }
 

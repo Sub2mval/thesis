@@ -127,15 +127,29 @@ def choose_shared_target_index(
     return pool[len(pool) // 2]
 
 
-async def run_paired_traces(magentic: "MagenticOneLangGraph", task: str, thread_id_prefix: str = "run") -> Dict[str, Any]:
+async def run_paired_traces(
+    magentic: "MagenticOneLangGraph", task: str, thread_id_prefix: str = "run", experiment_design: str = "4",
+) -> Dict[str, Any]:
     """Run `task` twice on one MagenticOneLangGraph instance's single
     compiled graph (same checkpointer) -- once with the Gricean checker
     off, once on -- under two thread_ids. Returns both configs (needed by
-    `fork_paired_traces_with_error` below) alongside each run's result."""
-    baseline_config = {"configurable": {"thread_id": f"{thread_id_prefix}-baseline"}}
-    gricean_config = {"configurable": {"thread_id": f"{thread_id_prefix}-gricean"}}
-    baseline_result = await magentic.run(task, thread_id=baseline_config["configurable"]["thread_id"], enable_gricean_check=False)
-    gricean_result = await magentic.run(task, thread_id=gricean_config["configurable"]["thread_id"], enable_gricean_check=True)
+    `fork_paired_traces_with_error` below) alongside each run's result.
+
+    experiment_design (see repo-root experiment_design.py) is passed
+    straight through to both magentic.run() calls, so the same selected
+    design drives both the baseline and checked side. It's also folded
+    into both thread_ids so traces from different designs never collide
+    under the same checkpointer."""
+    baseline_config = {"configurable": {"thread_id": f"{thread_id_prefix}-baseline-design{experiment_design}"}}
+    gricean_config = {"configurable": {"thread_id": f"{thread_id_prefix}-gricean-design{experiment_design}"}}
+    baseline_result = await magentic.run(
+        task, thread_id=baseline_config["configurable"]["thread_id"],
+        enable_gricean_check=False, experiment_design=experiment_design,
+    )
+    gricean_result = await magentic.run(
+        task, thread_id=gricean_config["configurable"]["thread_id"],
+        enable_gricean_check=True, experiment_design=experiment_design,
+    )
     return {
         "baseline_config": baseline_config,
         "gricean_config": gricean_config,

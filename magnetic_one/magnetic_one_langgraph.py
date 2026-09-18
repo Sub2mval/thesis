@@ -148,7 +148,7 @@ class MagenticOneLangGraph:
             except Exception as e:
                 warnings.warn(f"Error closing agent '{name}': {e}", stacklevel=2)
 
-    def _initial_state(self, task: str, enable_gricean_check: bool) -> Dict:
+    def _initial_state(self, task: str, enable_gricean_check: bool, experiment_design: str = "4") -> Dict:
         return {
             "task": task,
             "messages": [],
@@ -164,9 +164,20 @@ class MagenticOneLangGraph:
             "gricean_history": [],
             "pending_reflection": None,
             "reflection_history": [],
+            # Experiment-design / Trust_Allocator extension (see
+            # gricean_checker.py, experiment_design.py). "4" preserves
+            # the behavior above completely unchanged.
+            "experiment_design": experiment_design,
+            "pending_trust_level": None,
         }
 
-    async def run(self, task: str, thread_id: str = "default", enable_gricean_check: bool = True) -> Dict:
+    async def run(
+        self,
+        task: str,
+        thread_id: str = "default",
+        enable_gricean_check: bool = True,
+        experiment_design: str = "4",
+    ) -> Dict:
         # Reset usage for this trace. The same client instance is shared by
         # the orchestrator and worker agents, so this captures the complete
         # trace rather than only top-level orchestration calls.
@@ -175,14 +186,17 @@ class MagenticOneLangGraph:
             reset_usage_tracking(self.gricean_model_client)
 
         config = {"configurable": {"thread_id": thread_id}}
-        result = await self.graph.ainvoke(self._initial_state(task, enable_gricean_check), config=config)
+        result = await self.graph.ainvoke(
+            self._initial_state(task, enable_gricean_check, experiment_design), config=config
+        )
 
         main_usage = get_usage_tracking(self.client)
         gricean_usage = (
             get_usage_tracking(self.gricean_model_client)
             if self.gricean_model_client is not self.client
             else {"n_llm_calls": 0, "n_successful_calls": 0, "n_failed_attempts": 0,
-                  "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": []}
+                  "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                  "total_elapsed_seconds": 0, "calls": []}
         )
 
         calls = list(main_usage.get("calls", [])) + list(gricean_usage.get("calls", []))
@@ -197,11 +211,20 @@ class MagenticOneLangGraph:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "total_elapsed_seconds": sum(r.get("elapsed_seconds") or 0 for r in calls),
             "calls": calls,
         }
         return result
 
-    async def astream(self, task: str, thread_id: str = "default", enable_gricean_check: bool = True):
+    async def astream(
+        self,
+        task: str,
+        thread_id: str = "default",
+        enable_gricean_check: bool = True,
+        experiment_design: str = "4",
+    ):
         config = {"configurable": {"thread_id": thread_id}}
-        async for event in self.graph.astream(self._initial_state(task, enable_gricean_check), config=config):
+        async for event in self.graph.astream(
+            self._initial_state(task, enable_gricean_check, experiment_design), config=config
+        ):
             yield event

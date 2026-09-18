@@ -125,7 +125,13 @@ async def generate_corrupted_message(
         source=target["source"],
         original_content=target["content"],
     )
-    response = await model_client.create([UserMessage(content=prompt, source="ErrorInjector")])
+    # call_type="corruption" (PART 8) -- instrumentation-only label; see
+    # ollama_client.py's module docstring for how it's stripped before
+    # the real API call.
+    response = await model_client.create(
+        [UserMessage(content=prompt, source="ErrorInjector")],
+        extra_create_args={"call_type": "corruption"},
+    )
     assert isinstance(response.content, str)
     return {"content": response.content.strip(), "fm_id": mode["id"], "fm_name": mode["name"]}
 

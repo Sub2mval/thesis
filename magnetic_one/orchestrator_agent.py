@@ -62,13 +62,15 @@ def build_orchestrator_node(
 
     async def _bootstrap(state: MagenticState) -> MagenticState:
         planning = [UserMessage(content=ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT.format(task=state["task"]), source=ORCHESTRATOR_NAME)]
-        response = await model_client.create(get_compatible_context(model_client, planning))
+        response = await model_client.create(get_compatible_context(model_client, planning),
+                                              extra_create_args={"call_type": "orchestrator_task_ledger_facts"})
         facts = response.content
         planning += [
             UserMessage(content=facts, source=ORCHESTRATOR_NAME),
             UserMessage(content=ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT.format(team=description), source=ORCHESTRATOR_NAME),
         ]
-        response = await model_client.create(get_compatible_context(model_client, planning))
+        response = await model_client.create(get_compatible_context(model_client, planning),
+                                              extra_create_args={"call_type": "orchestrator_task_ledger_plan"})
 
         state = {
             **state,
@@ -80,6 +82,11 @@ def build_orchestrator_node(
         return {**state, "messages": [_ledger_message(state)]}
 
     async def _replan(state: MagenticState) -> MagenticState:
+        # Matches the pre-existing pending_reflection precedent: only
+        # _progress_ledger_pass below injects delivery-time context
+        # (reflection or, now, a trust notice) -- _replan and
+        # _final_answer rebuild context from the plain transcript, same
+        # as before.
         context = build_llm_context(state["messages"])
         context.append(
             UserMessage(
@@ -87,19 +94,21 @@ def build_orchestrator_node(
                 source=ORCHESTRATOR_NAME,
             )
         )
-        response = await model_client.create(get_compatible_context(model_client, context))
+        response = await model_client.create(get_compatible_context(model_client, context),
+                                              extra_create_args={"call_type": "orchestrator_task_ledger_facts_update"})
         facts = response.content
         context += [
             UserMessage(content=facts, source=ORCHESTRATOR_NAME),
             UserMessage(content=ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT.format(team=state["team_description"]), source=ORCHESTRATOR_NAME),
         ]
-        response = await model_client.create(get_compatible_context(model_client, context))
+        response = await model_client.create(get_compatible_context(model_client, context),
+                                              extra_create_args={"call_type": "orchestrator_task_ledger_plan_update"})
 
         state = {**state, "task_ledger": {"facts": facts, "plan": response.content}}
         return {**state, "messages": [_ledger_message(state)]}
 
     async def _progress_ledger_pass(state: MagenticState) -> MagenticState:
-        context = build_llm_context(state["messages"])
+        context = build_llm_context(state["messages"], wrap_last_with_level=state.get("pending_trust_level"))
         if state.get("pending_reflection"):
             context.append(UserMessage(content=state["pending_reflection"], source=ORCHESTRATOR_NAME))
         context.append(
@@ -124,7 +133,8 @@ def build_orchestrator_node(
                 return False, f'"next_speaker.answer" was {bad!r}, which does not match any team member name.', None
             return True, None, parsed
 
-        ledger = await call_model_for_json(model_client, get_compatible_context, context, validate, ORCHESTRATOR_NAME)
+        ledger = await call_model_for_json(model_client, get_compatible_context, context, validate, ORCHESTRATOR_NAME,
+                                            call_type="orchestrator_progress_ledger")
 
         n_stalls = state.get("n_stalls", 0)
         if not ledger["is_progress_being_made"]["answer"] or ledger["is_in_loop"]["answer"]:

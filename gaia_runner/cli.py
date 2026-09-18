@@ -16,6 +16,7 @@ from __future__ import annotations
 from dotenv import load_dotenv
 import argparse
 import asyncio
+import os
 from typing import Any, Dict, List
 
 from tqdm import tqdm
@@ -44,6 +45,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help="Inject one random error from this family only (default: one from each of the 3 families).")
     err.add_argument("--error-type", type=str, help="Inject exactly this fine-grained error type, e.g. FM-2.3.")
     p.add_argument("--systems", choices=["debate", "magnetic", "both"], default="both")
+    p.add_argument(
+        "--experiment-design", choices=["1", "2", "3", "4", "all"], default="4",
+        help="Which historical trust/adherence design to run under (see repo-root "
+             "experiment_design.py). \"4\" (the default) preserves the pre-existing "
+             "Gricean-checker behavior as closely as possible. \"1\", \"2\", and \"3\" "
+             "route every adherence check through the canonical Trust_Allocator "
+             "instead: \"1\" is the original 3-level trust system (a delivery-time "
+             "notice for every level, no reflection); \"2\" collapses medium into low "
+             "(high still gets its own notice, medium and low both get the LOW notice, "
+             "no reflection); \"3\" additionally suppresses the HIGH notice entirely "
+             "(HIGH is delivered transparently, with no notice at all; medium and low "
+             "still both get the LOW notice, no reflection). \"all\" runs the same "
+             "requested task(s) under designs 1, 2, 3, and 4 in turn, each writing to "
+             "its own design_<N> subdirectory of --out-dir so runs never overwrite one "
+             "another.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="gaia_runs/output")
     p.add_argument("--gaia-source", choices=["huggingface", "local"], default="huggingface")
@@ -78,16 +95,28 @@ def _debate_model_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
     return [{"model": args.debate_model, "host": args.ollama_cloud_host, "api_key": k} for k in keys]
 
 
-def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
+def _run_debate(
+    question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str, experiment_design: str
+) -> List[Dict[str, Any]]:
     from . import debate_system  # deferred: keeps a magnetic-only run from needing ollama/tenacity installed
     cfg = {"model_list": _debate_model_list(args), "temperature": 0, "seed": args.seed}
     rows: List[Dict[str, Any]] = []
-    for use_check in (False, True):
-        trace = debate_system.run_debate_baseline(question, cfg, use_check, args.agents_num, args.rounds_num)
-        trace_io.save_baseline_trace(out_dir, trace)
-        rows.append(trace_io.summary_row(trace, "baseline"))
-    forks = debate_system.run_debate_error_forks(question, cfg, error_plan, args.agents_num, args.rounds_num)
-    for i, fork_trace in enumerate(forks):
+    # The historical design experiment does NOT call run_debate_baseline()
+    # separately -- run_debate_error_forks() already produces the paired
+    # checker_off/checker_on (baseline/trust-enabled) NO-ERROR traces via
+    # run_paired_fork_experiment's own internal baseline-then-checked
+    # pass (see "baseline_traces" below), plus the FM-1.1 fork pair (see
+    # "fork_traces" below) -- exactly the four traces per design per
+    # system PART 1 of the instrumentation pass requires. Calling
+    # run_debate_baseline() here too would recompute and duplicate the
+    # same no-error pair for no reason.
+    result = debate_system.run_debate_error_forks(
+        question, cfg, error_plan, args.agents_num, args.rounds_num, experiment_design=experiment_design,
+    )
+    for baseline_trace in result["baseline_traces"]:
+        trace_io.save_baseline_trace(out_dir, baseline_trace)
+        rows.append(trace_io.summary_row(baseline_trace, "baseline"))
+    for i, fork_trace in enumerate(result["fork_traces"]):
         trace_io.save_fork_trace(out_dir, fork_trace, i)
         rows.append(trace_io.summary_row(fork_trace, "fork"))
     for row in rows:
@@ -95,7 +124,9 @@ def _run_debate(question: Dict[str, Any], args: argparse.Namespace, error_plan, 
     return rows
 
 
-def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str) -> List[Dict[str, Any]]:
+def _run_magnetic(
+    question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str, experiment_design: str
+) -> List[Dict[str, Any]]:
     from . import magnetic_system  # deferred: keeps a debate-only run from needing autogen installed
     if args.ollama_cloud:
         from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
@@ -107,12 +138,19 @@ def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan
         magentic = magnetic_system.build_magnetic_system(args.magnetic_model, args.gricean_model, args.magnetic_host)
     try:
         rows: List[Dict[str, Any]] = []
-        for use_check in (False, True):
-            trace = magnetic_system.run_magnetic_baseline(question, magentic, use_check)
-            trace_io.save_baseline_trace(out_dir, trace)
-            rows.append(trace_io.summary_row(trace, "baseline"))
-        forks = magnetic_system.run_magnetic_error_forks(question, magentic, error_plan)
-        for i, fork_trace in enumerate(forks):
+        # Same reasoning as _run_debate above: run_magnetic_error_forks()
+        # already produces the no-error baseline/trust-enabled pair (via
+        # run_paired_traces()) plus the FM-1.1 fork pair -- the four
+        # traces per design per system PART 1 of the instrumentation pass
+        # requires -- so run_magnetic_baseline() is NOT called separately
+        # here for the historical design experiment.
+        result = magnetic_system.run_magnetic_error_forks(
+            question, magentic, error_plan, experiment_design=experiment_design,
+        )
+        for baseline_trace in result["baseline_traces"]:
+            trace_io.save_baseline_trace(out_dir, baseline_trace)
+            rows.append(trace_io.summary_row(baseline_trace, "baseline"))
+        for i, fork_trace in enumerate(result["fork_traces"]):
             trace_io.save_fork_trace(out_dir, fork_trace, i)
             rows.append(trace_io.summary_row(fork_trace, "fork"))
         for row in rows:
@@ -131,6 +169,14 @@ def _run_magnetic(question: Dict[str, Any], args: argparse.Namespace, error_plan
         asyncio.run(magentic.close())
 
 
+def _selected_designs(experiment_design: str) -> List[str]:
+    """"all" -> every design the CLI knows about, in order; otherwise the
+    single design requested. Output isolation (design_<N> subdirectories)
+    is what lets "all" run every design back-to-back without one design's
+    traces overwriting another's -- see the --out-dir handling in main()."""
+    return ["1", "2", "3", "4"] if experiment_design == "all" else [experiment_design]
+
+
 def main(argv: List[str] = None) -> None:
     from dotenv import load_dotenv
     args = build_arg_parser().parse_args(argv)
@@ -141,17 +187,31 @@ def main(argv: List[str] = None) -> None:
                                            split=args.gaia_split, local_path=args.gaia_local_path)
     questions = select_questions(pool, n=args.n, task_ids=task_ids, seed=args.seed)
 
-    rows: List[Dict[str, Any]] = []
-    for question in tqdm(questions, desc="GAIA questions"):
-        if args.systems in ("debate", "both"):
-            rows += _run_debate(question, args, error_plan, args.out_dir)
-        if args.systems in ("magnetic", "both"):
-            rows += _run_magnetic(question, args, error_plan, args.out_dir)
+    designs = _selected_designs(args.experiment_design)
 
-    n_baseline = [r for r in rows if r["kind"] == "baseline"]
+    rows: List[Dict[str, Any]] = []
+    for design in designs:
+        # Every design gets its own output subdirectory so runs under
+        # different designs -- including every design in one "all" run --
+        # can never overwrite one another's traces/summary.jsonl.
+        design_out_dir = os.path.join(args.out_dir, f"design_{design}")
+        for question in tqdm(questions, desc=f"GAIA questions (design {design})"):
+            if args.systems in ("debate", "both"):
+                rows += _run_debate(question, args, error_plan, design_out_dir, design)
+            if args.systems in ("magnetic", "both"):
+                rows += _run_magnetic(question, args, error_plan, design_out_dir, design)
+
+    # PART 1 of the instrumentation pass restored the no-error
+    # baseline/trust-condition traces _run_debate/_run_magnetic used to
+    # discard -- "baseline" kind rows are back, so accuracy is reported
+    # against those (use_gricean_check=False = the true no-error baseline
+    # condition) again, rather than the checker_off-with-FM-1.1-fork
+    # traces this used as a stand-in for it in between.
+    n_baseline = [r for r in rows if r["kind"] == "baseline" and r.get("condition") is False]
     n_correct = sum(1 for r in n_baseline if r.get("correct"))
-    print(f"\nDone. {len(questions)} question(s), {len(rows)} trace(s) written to {args.out_dir}")
-    print(f"Baseline accuracy: {n_correct}/{len(n_baseline)}")
+    print(f"\nDone. {len(questions)} question(s) x {len(designs)} design(s), "
+          f"{len(rows)} trace(s) written under {args.out_dir}")
+    print(f"Baseline (no-error, checker off) accuracy: {n_correct}/{len(n_baseline)}")
 
 
 if __name__ == "__main__":
