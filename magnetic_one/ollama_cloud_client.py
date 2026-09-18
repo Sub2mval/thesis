@@ -170,7 +170,10 @@ def _build_client_for_key(
                 model,
                 e,
             )
-            return OllamaChatCompletionClient(model=model, host=host, model_info=_FALLBACK_MODEL_INFO, options=options)
+            return InstrumentedOllamaChatCompletionClient(
+                OllamaChatCompletionClient(model=model, host=host, model_info=_FALLBACK_MODEL_INFO, options=options),
+                model=model, host=host, key_identifier=key_identifier, generation_options=options,
+            )
 
 
 class RotatingKeyOllamaClient:
