@@ -323,6 +323,8 @@ def build_ollama_client(
             "explicitly for accurate behavior.",
             stacklevel=2,
         )
-        return OllamaChatCompletionClient(
-            model=model, host=host, model_info=_FALLBACK_MODEL_INFO, options=merged_options, **kwargs
+        return InstrumentedOllamaChatCompletionClient(
+            OllamaChatCompletionClient(model=model, host=host, model_info=_FALLBACK_MODEL_INFO,
+                                        options=merged_options, **kwargs),
+            model=model, host=host, key_identifier=key_identifier, generation_options=merged_options,
         )
