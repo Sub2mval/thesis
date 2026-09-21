@@ -87,8 +87,11 @@ from trust_allocator import legacy_trust_allocator
 
 logger = logging.getLogger("magentic_one_langgraph.gricean_checker")
 
-# Only recent context is needed to judge consistency, unlike the
-# Orchestrator's own loop-detection, which needs the full history.
+# Used only by the legacy 4-axis checker below (_legacy_gricean_checker_node),
+# which only needs recent context to judge local consistency, unlike the
+# Orchestrator's own loop-detection, which needs the full history. The
+# canonical Trust_Allocator branch (_run_trust_allocator_design) does NOT
+# use this -- it is given the full message history, unwindowed.
 ADHERENCE_CHECK_CONTEXT_WINDOW = 6
 
 _TRUST_REFLECTION_PROMPT = """You are about to receive the following message from "%%SOURCE%%":
@@ -131,17 +134,22 @@ async def _run_trust_allocator_design(
     and 4 are all implemented. Only called when enable_gricean_check is
     on -- see the baseline short-circuit in gricean_checker_node() below.
 
-    Mirrors gricean_checker_node's own shape (window, history append,
-    return dict) so the two branches stay easy to compare, but writes to
+    Mirrors gricean_checker_node's own shape (history append, return
+    dict) so the two branches stay easy to compare, but writes to
     `pending_trust_level` in addition to `pending_reflection`. Designs 1,
     2, and 3's policies are all reflect=False, unconditionally, so the
     reflection-generating gricean_client.create(...) call below is never
     reached for them; Design 4's policy is reflect=True for medium/low
     verdicts, which is what actually exercises that call.
+
+    Unlike the legacy 4-axis checker below (which only needs recent
+    context to judge local consistency, hence ADHERENCE_CHECK_CONTEXT_
+    WINDOW), the canonical Trust_Allocator gets the FULL message history
+    -- no windowing -- so its verdict can be grounded in everything said
+    so far, not just the last few turns.
     """
-    window = messages[-ADHERENCE_CHECK_CONTEXT_WINDOW:]
     conversation = legacy_trust_allocator.format_conversation(
-        [{"source": m["source"], "content": m["content"]} for m in window]
+        [{"source": m["source"], "content": m["content"]} for m in messages]
     )
 
     async def _client(prompt: str) -> str:
