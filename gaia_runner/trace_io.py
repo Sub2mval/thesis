@@ -2,7 +2,14 @@
 Where and how a run's traces get written to disk:
 
     {out_dir}/{task_id}/{system}__baseline_{on|off}.json
+    {out_dir}/{task_id}/{system}__baseline_{on|off}.readable.json
     {out_dir}/{task_id}/{system}__fork{n}_{fm_id_or_family}_{on|off}.json
+    {out_dir}/{task_id}/{system}__fork{n}_{fm_id_or_family}_{on|off}.readable.json
+
+Every trace now gets written as two files: the machine-shaped trace exactly
+as before, and a ".readable.json" sibling (see readable_trace.py) laid out
+for a person to read -- initial question, then every agent turn / Trust_
+Allocator verdict / corrupted-message event in generation order.
 
 Plus {out_dir}/summary.jsonl with one line per trace, appended as each
 trace completes -- so a crash partway through a long benchmark run
@@ -16,6 +23,8 @@ import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+from . import readable_trace
 
 
 def now_iso() -> str:
@@ -40,10 +49,16 @@ def _write_json(path: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2, default=str)
 
 
+def _readable_path(json_path: str) -> str:
+    root, ext = os.path.splitext(json_path)
+    return f"{root}.readable{ext}"
+
+
 def save_baseline_trace(out_dir: str, trace: Dict[str, Any]) -> str:
     condition = "on" if trace["use_gricean_check"] else "off"
     path = os.path.join(out_dir, trace["task_id"], f"{trace['system']}__baseline_{condition}.json")
     _write_json(path, trace)
+    readable_trace.write_readable_trace(_readable_path(path), trace)
     return path
 
 
@@ -53,6 +68,7 @@ def save_fork_trace(out_dir: str, trace: Dict[str, Any], fork_index: int) -> str
     fname = f"{trace['system']}__fork{fork_index}_{fm_tag}_{condition}.json"
     path = os.path.join(out_dir, trace["task_id"], fname)
     _write_json(path, trace)
+    readable_trace.write_readable_trace(_readable_path(path), trace)
     return path
 
 
