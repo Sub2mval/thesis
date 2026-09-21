@@ -76,7 +76,7 @@ def _trust_history(gricean_history: Optional[List[Dict[str, Any]]]) -> List[Dict
         out.append({
             "step": entry.get("round"), "message_index": i,
             "evaluated_source": f"Agent{entry.get('agent_id', 0) + 1}", "agent_id": entry.get("agent_id"),
-            "trust_level": entry.get("level"), "reason": entry.get("reason"), "scores": entry.get("scores"),
+            "trust_level": entry.get("level"), "reason": entry.get("reason"), "score": entry.get("score"), "scores": entry.get("scores"),
         })
     return out
 
