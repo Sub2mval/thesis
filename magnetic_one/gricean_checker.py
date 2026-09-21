@@ -170,7 +170,8 @@ async def _run_trust_allocator_design(
             "evaluated_source": last["source"],
             "adherence_level": raw_trust_level,  # the allocator's raw verdict, not a Gricean level
             "reason": reason,
-            "scores": None,  # the Trust_Allocator has no per-axis scores, unlike the Gricean checker
+            "score": verdict["score"],
+            "scores": verdict["scores"],
             "experiment_design": design,
             "notice_applied": policy["notice"],
             "reflect": policy["reflect"],
