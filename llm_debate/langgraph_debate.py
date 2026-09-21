@@ -163,8 +163,16 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
         parts.append(f"\nAgent {agent_id + 1}: ```{delivered}```")
         if info and info.get("reflect"):
             flagged.append((agent_id, content, info.get("reason", "")))
-    parts.append(f"\n\nUsing this as advice, give an updated answer to: {question}\n"
-                  "State your final answer clearly at the end.")
+    parts.append(
+        f"\n\nCritically check the other agents' answers above, step by step, against the task.\n"
+        f"Task: {question}\n"
+        "For each other agent: verify their work yourself rather than assuming it's right because "
+        "someone else wrote it. If you find a specific error, missed case, or a different reading of "
+        "the question, say exactly what it is and where it's wrong -- quoting or pointing to the "
+        "specific step. If, after checking carefully, you find no error, say so explicitly and state "
+        "what you checked (do not agree merely because the other agent's conclusion matches yours).\n"
+        "Then give your own answer, revised if your check turned up a problem.\n"
+        "State your final answer clearly at the end.")
     return {"role": "user", "content": "\n".join(parts)}, flagged
 
 
@@ -327,7 +335,7 @@ async def _trust_allocator_check(state: DebateState, speaker: int, ctx: List[Mes
     gricean_history = list(state["gricean_history"])
     gricean_history.append({
         "round": msg_round, "agent_id": speaker, "level": raw_trust_level, "reason": reason,
-        "scores": None,  # the Trust_Allocator has no per-axis scores, unlike the Gricean checker
+        "score": verdict["score"], "scores": verdict["scores"],  # mean + per-maxim 1-5 scores from the allocator
         "experiment_design": design, "notice_applied": policy["notice"], "reflect": policy["reflect"],
     })
     return {"adherence": adherence, "gricean_history": gricean_history}
