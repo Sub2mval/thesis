@@ -143,13 +143,19 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
     itself, per that design's notice policy. `flagged` is populated only
     for entries whose policy says reflect=True -- never true under
     Designs 1-3 (always reflect=False), but true for a medium/low verdict
-    under Design 4."""
+    under Design 4.
+
+    round_idx is unused -- kept as a parameter for call-site compatibility.
+    Each other agent's MOST RECENT reply (ctx[-1]) is shown instead of a
+    fixed round offset, so a later agent in the same round sees an
+    earlier agent's answer from THIS round, not last round's frozen
+    snapshot. See agent_turn's comment for why."""
     if not others:
         return {"role": "user", "content": "Please verify and restate your answer clearly at the end."}, []
     parts = ["Other agents' current answers:"]
     flagged: List[Tuple[int, str, str]] = []
     for agent_id, ctx in others:
-        content = ctx[round_idx]["content"]
+        content = ctx[-1]["content"]
         info = adherence.get(agent_id)
         delivered = content
         if info and info.get("notice"):
@@ -231,8 +237,20 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
     i, r = state["agent_idx"], state["round"]
     contexts = [list(c) for c in state["contexts"]]
     flagged: List[Tuple[int, str, str]] = []
-    if r != 0:
-        others = [(j, contexts[j]) for j in range(state["agents_num"]) if j != i]
+    # Sequential visibility: show agent i every other agent's MOST RECENT
+    # reply so far, whether that's from this round (an earlier agent in
+    # the turn order already spoke) or the previous round (that agent
+    # hasn't gone yet this round). This makes agent 2 react to agent 1's
+    # just-given answer, agent 3 react to both, and next round's agent 1
+    # react to everyone's latest -- instead of every agent in a round
+    # reacting to the same frozen previous-round snapshot, which collapses
+    # to identical output across agents at temperature 0. Agents who
+    # haven't spoken at all yet (round 0, later agent_idx) are excluded so
+    # they aren't shown their own seed question back as another agent's
+    # "answer".
+    others = [(j, contexts[j]) for j in range(state["agents_num"])
+              if j != i and contexts[j][-1]["role"] == "assistant"]
+    if others:
         design = state.get("experiment_design", "4")
         # Adherence history is always collected (see gricean_check below,
         # which now runs unconditionally) so it's available for analysis
@@ -247,7 +265,7 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         # which design is selected -- see gricean_checker.py's baseline
         # branch in magnetic_one for the matching enforcement there.
         visible_adherence = state["adherence"] if state["use_gricean_check"] else {}
-        broadcast, flagged = construct_broadcast(others, state["query"], 2 * r - 1, visible_adherence, design)
+        broadcast, flagged = construct_broadcast(others, state["query"], -1, visible_adherence, design)
         contexts[i].append(broadcast)
 
     reflections = {k: list(v) for k, v in state["reflections"].items()}
