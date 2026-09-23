@@ -22,7 +22,13 @@ Each event in "conversation" is one of:
     has an entry for that message_index. This is exactly the "question,
     agent1, trust allocator, agent2, trust allocator, ..." order, since
     trace["messages"] and trace["trust_history"] are both already stored
-    in generation order (see debate_system.py / magnetic_system.py).
+    in generation order (see debate_system.py / magnetic_system.py). A
+    Trust_Allocator turn's agent_input spells out BOTH the task and the
+    message being evaluated, since allocate() (legacy_trust_allocator.py)
+    actually feeds it both (%%TASK%% and %%CONVERSATION%%/%%LAST_SPEAKER%%)
+    -- showing only the evaluated message here would make it look like the
+    question was withheld from the allocator, which isn't true of the
+    actual call.
   - a corrupted-message turn, wherever trace["fork_metadata"] says a
     message was injected: {"old_message": ..., "agent": ...,
     "corrupters_input": ..., "error_type": ..., "corrupted_message": ...}
@@ -120,7 +126,7 @@ def _debate_input_lookup(trace: Dict[str, Any]):
     return lookup
 
 
-def _trust_event(t: Dict[str, Any], evaluated_content: str) -> Dict[str, Any]:
+def _trust_event(t: Dict[str, Any], evaluated_content: str, question: str) -> Dict[str, Any]:
     level = str(t.get("trust_level") or "").upper()
     reason = t.get("reason") or ""
     extras = []
@@ -129,9 +135,18 @@ def _trust_event(t: Dict[str, Any], evaluated_content: str) -> Dict[str, Any]:
     if t.get("reflect"):
         extras.append("reflection triggered")
     suffix = f" ({'; '.join(extras)})" if extras else ""
+    # allocate() (trust_allocator/legacy_trust_allocator.py) fills the
+    # Trust_Allocator prompt's %%TASK%% from the original question AND
+    # %%CONVERSATION%%/%%LAST_SPEAKER%% from the message being evaluated --
+    # both go into the actual model call. Showing only the evaluated
+    # message here (as an earlier version of this file did) made it look
+    # like the question was never given to the allocator, which wasn't
+    # true of the underlying call -- just of this display. Spelling out
+    # both pieces makes that directly checkable from the file itself.
+    agent_input = f"Task (GAIA question) given to Trust_Allocator: {question}\n\nMessage being evaluated: {evaluated_content}"
     return {
         "agent_name": "Trust_Allocator",
-        "agent_input": evaluated_content,
+        "agent_input": agent_input,
         "agent_output": f"{level} trust{suffix} -- {reason}".strip(),
     }
 
@@ -181,7 +196,7 @@ def _build_events(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         t = trust_by_index.get(idx)
         if t is not None:
-            events.append(_trust_event(t, content))
+            events.append(_trust_event(t, content, trace.get("question")))
 
     return events
 
