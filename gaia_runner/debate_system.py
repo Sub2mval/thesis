@@ -272,8 +272,6 @@ def run_debate_error_forks(
         ))
         no_error_stats_off = token_usage.summarize_calls(pair_result["no_error_records_off"])
         no_error_stats_on = token_usage.summarize_calls(pair_result["no_error_records_on"])
-        error_stats_off = token_usage.summarize_calls(pair_result["error_off_records"])
-        error_stats_on = token_usage.summarize_calls(pair_result["error_on_records"])
 
         for use_gricean_check, no_error_state, stats in (
             (False, pair_result["no_error_off"], no_error_stats_off),
@@ -288,6 +286,12 @@ def run_debate_error_forks(
                 use_gricean_check=use_gricean_check, started_at=started_at,
                 experiment_design=experiment_design,
             ))
+
+        if pair_result.get("skipped") or not pair_result.get("error_off") or not pair_result.get("error_on"):
+            continue
+
+        error_stats_off = token_usage.summarize_calls(pair_result["error_off_records"])
+        error_stats_on = token_usage.summarize_calls(pair_result["error_on_records"])
 
         for label, result, stats in (
             ("checker_off", pair_result["error_off"], error_stats_off),
