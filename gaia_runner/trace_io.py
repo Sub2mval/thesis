@@ -2,12 +2,12 @@
 Where and how a run's traces get written to disk:
 
     {out_dir}/{task_id}/{system}__baseline_{on|off}.json
-    {out_dir}/{task_id}/{system}__baseline_{on|off}.readable.json
+    {out_dir}/{task_id}/{system}__baseline_{on|off}.md
     {out_dir}/{task_id}/{system}__fork{n}_{fm_id_or_family}_{on|off}.json
-    {out_dir}/{task_id}/{system}__fork{n}_{fm_id_or_family}_{on|off}.readable.json
+    {out_dir}/{task_id}/{system}__fork{n}_{fm_id_or_family}_{on|off}.md
 
 Every trace now gets written as two files: the machine-shaped trace exactly
-as before, and a ".readable.json" sibling (see readable_trace.py) laid out
+as before, and a ".md" sibling (see readable_trace.py) laid out
 for a person to read -- initial question, then every agent turn / Trust_
 Allocator verdict / corrupted-message event in generation order.
 
@@ -50,8 +50,8 @@ def _write_json(path: str, payload: Dict[str, Any]) -> None:
 
 
 def _readable_path(json_path: str) -> str:
-    root, ext = os.path.splitext(json_path)
-    return f"{root}.readable{ext}"
+    root, _ = os.path.splitext(json_path)
+    return f"{root}.md"
 
 
 def save_baseline_trace(out_dir: str, trace: Dict[str, Any]) -> str:
