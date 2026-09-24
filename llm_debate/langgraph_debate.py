@@ -176,25 +176,6 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
     return {"role": "user", "content": "\n".join(parts)}, flagged
 
 
-def _raw_broadcast(others: List[Tuple[int, List[Message]]], question: str) -> Message:
-    """Build the same broadcast without any transient Trust notice."""
-    message, _ = construct_broadcast(others, question, -1, {}, "4")
-    return message
-
-
-def _canonical_agent_outputs(contexts: List[List[Message]], agents_num: int) -> List[Dict[str, str]]:
-    """Return only raw assistant outputs, in turn order. Prompt/notice text
-    from an agent's private context is deliberately excluded from the
-    Trust_Allocator evidence packet."""
-    replies = [[m["content"] for m in ctx if m.get("role") == "assistant"] for ctx in contexts]
-    out: List[Dict[str, str]] = []
-    for round_idx in range(max((len(r) for r in replies), default=0)):
-        for agent_id in range(agents_num):
-            if round_idx < len(replies[agent_id]):
-                out.append({"source": f"Agent{agent_id + 1}", "content": replies[agent_id][round_idx]})
-    return out
-
-
 def _reflection_prompt(query: str, flagged: List[Tuple[int, str, str]]) -> str:
     blocks = "\n\n".join(
         f"Flagged message from Agent {aid + 1}:\n```{content}```\nTrust_Allocator's reason for the LOW-trust verdict: {reason}"
@@ -293,13 +274,7 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         # branch in magnetic_one for the matching enforcement there.
         visible_adherence = state["adherence"] if state["use_gricean_check"] else {}
         broadcast, flagged = construct_broadcast(others, state["query"], -1, visible_adherence, design)
-        # Store only the raw broadcast. Trust notices are delivery-time metadata
-        # and must never become part of the agent's persistent context.
-        raw_broadcast = _raw_broadcast(others, state["query"])
-        contexts[i].append(raw_broadcast)
-        delivered_broadcast = broadcast
-    else:
-        delivered_broadcast = None
+        contexts[i].append(broadcast)
 
     reflections = {k: list(v) for k, v in state["reflections"].items()}
     extra: List[Message] = []
@@ -318,23 +293,38 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         extra = [{"role": "user", "content": f"[Private reflection -- not part of the shared conversation]\n"
                                               f"{reflection}\n\nNow give your updated answer to the task."}]
 
-    turn_context = list(contexts[i])
-    if delivered_broadcast is not None:
-        turn_context[-1] = delivered_broadcast
-    reply = call_llm(turn_context + extra, state["config"], call_type="agent_turn")
+    reply = call_llm(contexts[i] + extra, state["config"], call_type="agent_turn")
     contexts[i].append({"role": "assistant", "content": reply})
     next_i = (i + 1) % state["agents_num"]
     return {"contexts": contexts, "agent_idx": next_i, "round": r + 1 if next_i == 0 else r,
             "reflections": reflections}
 
 
-def _debate_client_for_allocator(config: Dict[str, Any]):
-    """Adapt langgraph_debate's own call_llm() into the sync
-    ClientCallable shape trust_allocator.legacy_trust_allocator.allocate
-    expects (prompt string -> raw response string)."""
+def _debate_client_for_allocator(
+    config: Dict[str, Any], attachment: Optional[Dict[str, Any]] = None
+):
+    """Adapt call_llm() to the allocator's prompt-only callable while keeping
+    the task attachment as a separate delivery-time input. Text attachments
+    are included once in the allocator request; image/audio attachments use
+    Ollama's native message fields already supported by call_llm()."""
 
     def _client(prompt: str) -> str:
-        return call_llm([{"role": "user", "content": prompt}], config, call_type="trust_allocator")
+        message: Message = {"role": "user", "content": prompt}
+        if attachment:
+            if attachment.get("text"):
+                note = f" {attachment['note']}" if attachment.get("note") else ""
+                message["content"] += (
+                    f"\n\n[AVAILABLE TASK ATTACHMENT]{note}\n\n{attachment['text']}"
+                )
+            if attachment.get("images_b64"):
+                message["images"] = list(attachment["images_b64"])
+            if attachment.get("audio_b64"):
+                message["audio"] = list(attachment["audio_b64"])
+            if attachment.get("kind") == "unsupported" and attachment.get("note"):
+                message["content"] += (
+                    f"\n\n[AVAILABLE TASK ATTACHMENT COULD NOT BE INCLUDED: {attachment['note']}]"
+                )
+        return call_llm([message], config, call_type="trust_allocator")
 
     return _client
 
@@ -347,9 +337,18 @@ async def _trust_allocator_check(state: DebateState, speaker: int, ctx: List[Mes
     called when use_gricean_check is on -- see the baseline short-circuit
     in gricean_check() below."""
     design = state["experiment_design"]
-    conversation = format_conversation(_canonical_agent_outputs(state["contexts"], state["agents_num"]))
+    # The initial per-agent user message may already contain the attachment
+    # payload. The allocator receives the attachment separately below, so do
+    # not duplicate that payload inside its conversational transcript.
+    conversation_messages = [
+        {"source": m["role"], "content": m["content"]}
+        for idx, m in enumerate(ctx)
+        if not (idx == 0 and m.get("role") == "user")
+    ]
+    conversation = format_conversation(conversation_messages)
     verdict = await allocate_trust(
-        state["query"], conversation, f"Agent {speaker + 1}", _debate_client_for_allocator(state["config"])
+        state["query"], conversation, f"Agent {speaker + 1}",
+        _debate_client_for_allocator(state["config"], state.get("attachment"))
     )
     raw_trust_level = verdict["trust_level"]
     reason = verdict["reason"]
