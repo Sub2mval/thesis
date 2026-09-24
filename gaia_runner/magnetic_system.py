@@ -123,6 +123,21 @@ def _combined_usage(magentic: MagenticOneLangGraph) -> Dict[str, Any]:
     }
 
 
+def _combined_usage_from_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prompt_tokens = sum(c.get("prompt_tokens") or 0 for c in calls)
+    completion_tokens = sum(c.get("completion_tokens") or 0 for c in calls)
+    return {
+        "n_llm_calls": len(calls),
+        "n_successful_calls": sum(c.get("status") == "ok" for c in calls),
+        "n_failed_attempts": sum(c.get("status") == "error" for c in calls),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "total_elapsed_seconds": sum(c.get("elapsed_seconds") or 0 for c in calls),
+        "calls": calls,
+    }
+
+
 def _build_trace(
     question: Dict[str, Any],
     final_state: Dict[str, Any],
@@ -142,6 +157,8 @@ def _build_trace(
     target_source: Optional[str] = None,
     started_at: Optional[str] = None,
     experiment_design: str = "4",
+    injection: Optional[Dict[str, Any]] = None,
+    injection_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Builds one trace dict, shaped to match this project's established
     magnetic_one trace schema (task_id/question/ground_truth/level/graph/
@@ -174,6 +191,8 @@ def _build_trace(
         "termination_reason": final_state.get("termination_reason"),
         "token_stats": token_stats,
         "started_at": started_at, "finished_at": _now_iso(),
+        "injection": injection,
+        "injection_calls": injection_calls or [],
     }
     if fm_id is not None:
         trace["injected_at_message_index"] = injected_at_message_index
@@ -269,22 +288,27 @@ def run_magnetic_error_forks(
         if magentic.gricean_model_client is not magentic.client:
             reset_usage_tracking(magentic.gricean_model_client)
         started_at = _now_iso()
+        usage_clients = [magentic.client] if magentic.gricean_model_client is magentic.client else [magentic.client, magentic.gricean_model_client]
         fork = asyncio.run(fork_paired_traces_with_error(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
-            error_type, ORCHESTRATOR_NAME, fm_id=fm_id, strategy=strategy,
+            error_type, ORCHESTRATOR_NAME, fm_id=fm_id, strategy=strategy, usage_clients=usage_clients,
         ))
-        stats = _combined_usage(magentic)
+        stats_by_side = {
+            "checker_off": _combined_usage_from_calls(fork["baseline"].get("calls", [])),
+            "checker_on": _combined_usage_from_calls(fork["gricean_checked"].get("calls", [])),
+        }
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
             side_result = fork[side]
             final_state = side_result["final_state"]
             fork_traces.append(_build_trace(
-                question, final_state, stats,
+                question, final_state, stats_by_side[label],
                 thread_id=f"{question['task_id']}::magnetic_one::{label}::design{experiment_design}",
                 fork_condition=label, error_type=fork["error_type"], fm_id=fork["fm_id"], fm_name=fork["fm_name"],
                 injected_at_message_index=fork["injected_at_message_index"],
                 injected_at_step=side_result.get("injected_at_step"), injected_at_node=side_result.get("injected_at_node"),
                 original_message=side_result.get("original_message"), corrupted_message=fork["corrupted_message"],
-                started_at=started_at, experiment_design=experiment_design,
+                started_at=started_at, experiment_design=experiment_design, injection=fork.get("injection"),
+                injection_calls=fork.get("injection_calls"),
             ))
     return {"baseline_traces": baseline_traces, "fork_traces": fork_traces}
 
@@ -341,24 +365,25 @@ def run_magnetic_error_forks_by_source(
             reset_usage_tracking(magentic.gricean_model_client)
 
         started_at = _now_iso()
+        usage_clients = [magentic.client] if magentic.gricean_model_client is magentic.client else [magentic.client, magentic.gricean_model_client]
         fork = asyncio.run(fork_paired_traces_with_error(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
-            error_type, ORCHESTRATOR_NAME, fm_id=fm_id, target_message_index=idx,
+            error_type, ORCHESTRATOR_NAME, fm_id=fm_id, target_message_index=idx, usage_clients=usage_clients,
         ))
-        stats = _combined_usage(magentic)
         rows = []
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
             side_result = fork[side]
             final_state = side_result["final_state"]
             rows.append(_build_trace(
-                question, final_state, stats,
+                question, final_state, _combined_usage_from_calls(side_result.get("calls", [])),
                 thread_id=f"{question['task_id']}::magnetic_one::{source}::{label}",
                 fork_condition=label, target_source=source,
                 error_type=fork["error_type"], fm_id=fork["fm_id"], fm_name=fork["fm_name"],
                 injected_at_message_index=idx,
                 injected_at_step=side_result.get("injected_at_step"), injected_at_node=side_result.get("injected_at_node"),
                 original_message=side_result.get("original_message"), corrupted_message=fork["corrupted_message"],
-                started_at=started_at,
+                started_at=started_at, injection=fork.get("injection"),
+                injection_calls=fork.get("injection_calls"),
             ))
         results[source] = rows
     return results
