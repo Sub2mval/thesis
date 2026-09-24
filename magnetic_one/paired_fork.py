@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional
 from autogen_core.models import ChatCompletionClient
 
 from magnetic_one.error_injection import generate_corrupted_message, list_message_checkpoints
+from magnetic_one.failure_modes import choose_failure_mode
 from magnetic_one.state import ThreadMessage
 from magnetic_one.ollama_client import get_usage_tracking
 
@@ -107,6 +108,41 @@ def shared_prefix_length(
     return n
 
 
+def _shared_target_candidates(
+    baseline_messages: List[ThreadMessage],
+    gricean_messages: List[ThreadMessage],
+    orchestrator_name: str,
+    strategy: str = "middle_agent_message",
+    baseline_gricean_history: Optional[List[Dict[str, Any]]] = None,
+    gricean_gricean_history: Optional[List[Dict[str, Any]]] = None,
+) -> List[int]:
+    shared_len = shared_prefix_length(
+        baseline_messages, gricean_messages, baseline_gricean_history, gricean_gricean_history
+    )
+    if shared_len == 0:
+        raise ValueError("Baseline and Gricean-checked traces share no common prefix -- nothing to fork from.")
+
+    agent_candidates = [i for i in range(shared_len) if baseline_messages[i]["source"] != orchestrator_name]
+    pool = agent_candidates or list(range(shared_len))
+    if strategy == "first_agent_message":
+        first = pool[0]
+    elif strategy == "last_agent_message":
+        first = pool[-1]
+    else:
+        first = pool[len(pool) // 2]
+
+    # Preserve the historical target-selection behavior, then allow the
+    # injector to move only one raw message index backward or forward if the
+    # chosen message is not a safe target. Do not search arbitrarily far
+    # through the execution because that would change the intervention point.
+    ordered = [first]
+    if first - 1 >= 0:
+        ordered.append(first - 1)
+    if first + 1 < shared_len:
+        ordered.append(first + 1)
+    return ordered
+
+
 def choose_shared_target_index(
     baseline_messages: List[ThreadMessage],
     gricean_messages: List[ThreadMessage],
@@ -115,17 +151,10 @@ def choose_shared_target_index(
     baseline_gricean_history: Optional[List[Dict[str, Any]]] = None,
     gricean_gricean_history: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
-    shared_len = shared_prefix_length(baseline_messages, gricean_messages, baseline_gricean_history, gricean_gricean_history)
-    if shared_len == 0:
-        raise ValueError("Baseline and Gricean-checked traces share no common prefix -- nothing to fork from.")
-
-    candidates = [i for i in range(shared_len) if baseline_messages[i]["source"] != orchestrator_name]
-    pool = candidates or list(range(shared_len))
-    if strategy == "first_agent_message":
-        return pool[0]
-    if strategy == "last_agent_message":
-        return pool[-1]
-    return pool[len(pool) // 2]
+    return _shared_target_candidates(
+        baseline_messages, gricean_messages, orchestrator_name, strategy,
+        baseline_gricean_history, gricean_gricean_history,
+    )[0]
 
 
 async def run_paired_traces(
@@ -222,40 +251,113 @@ async def fork_paired_traces_with_error(
     gricean_gricean_history = gricean_checkpoints[-1]["snapshot"].values.get("gricean_history", [])
 
     if target_message_index is None:
-        idx = choose_shared_target_index(baseline_messages, gricean_messages, orchestrator_name, strategy,
-                                          baseline_gricean_history, gricean_gricean_history)
+        candidate_indices = _shared_target_candidates(
+            baseline_messages, gricean_messages, orchestrator_name, strategy,
+            baseline_gricean_history, gricean_gricean_history,
+        )
     else:
         idx = target_message_index
         shared_len = shared_prefix_length(baseline_messages, gricean_messages, baseline_gricean_history, gricean_gricean_history)
-        if idx >= shared_len:
+        if idx < 0 or idx >= shared_len:
             raise ValueError(f"message index {idx} is not in the shared prefix (only the first {shared_len} messages are guaranteed identical).")
+        candidate_indices = [idx]
+        if idx - 1 >= 0:
+            candidate_indices.append(idx - 1)
+        if idx + 1 < shared_len:
+            candidate_indices.append(idx + 1)
 
-    # Generate the corruption ONCE, off the shared (hence identical-either-
-    # way) prefix, so both forks get the exact same corrupted text rather
-    # than two independently-sampled corruptions.
+    # Generate one usable corruption from the shared pre-error state. If a
+    # candidate is semantically ineligible for either trace, try only the
+    # immediate neighboring shared message. The failure mode is selected once
+    # so every attempt refers to the same FM, and the first eligible corruption
+    # is then applied identically to both branches.
     clients = usage_clients or [model_client]
     before_injection = [list(get_usage_tracking(client).get("calls", [])) for client in clients]
-    target_source = baseline_messages[idx]["source"]
-    corruption = await generate_corrupted_message(
-        model_client, task, baseline_messages, idx, error_type, fm_id,
-        target_role=target_source,
-    )
+    corruption = None
+    idx = None
+    target_source = None
+    selected_mode = choose_failure_mode(error_type, fm_id)
+    selected_fm_id = selected_mode["id"]
+    injection_attempts: List[Dict[str, Any]] = []
+    for candidate_idx in candidate_indices:
+        candidate_source = baseline_messages[candidate_idx]["source"]
+        comparison_source = gricean_messages[candidate_idx]["source"]
+        if candidate_source != comparison_source:
+            injection_attempts.append({
+                "message_index": candidate_idx,
+                "target_source": candidate_source,
+                "comparison_source": comparison_source,
+                "fm_id": selected_fm_id,
+                "fm_name": selected_mode["name"],
+                "eligible": False,
+                "eligibility_reason": "Paired candidate messages do not have the same source/role.",
+            })
+            continue
+        candidate_corruption = await generate_corrupted_message(
+            model_client, task, baseline_messages, candidate_idx, error_type, selected_fm_id,
+            target_role=candidate_source, comparison_messages=gricean_messages,
+        )
+        if candidate_corruption.get("eligible", True) and isinstance(candidate_corruption.get("content"), str) and candidate_corruption["content"].strip():
+            corruption = candidate_corruption
+            idx = candidate_idx
+            target_source = candidate_source
+            break
+        injection_attempts.append({
+            "message_index": candidate_idx,
+            "target_source": candidate_source,
+            "comparison_source": comparison_source,
+            "fm_id": candidate_corruption.get("fm_id") or selected_fm_id,
+            "fm_name": candidate_corruption.get("fm_name") or selected_mode["name"],
+            "eligible": candidate_corruption.get("eligible"),
+            "eligibility_reason": candidate_corruption.get("eligibility_reason"),
+            "injector_response": candidate_corruption.get("injector_response"),
+        })
+
     injection_calls: List[Dict[str, Any]] = []
     for client, before in zip(clients, before_injection):
         after = list(get_usage_tracking(client).get("calls", []))
         injection_calls.extend(after[len(before):])
     injection_calls.sort(key=lambda r: (r.get("started_at_unix", 0), r.get("call_index", 0)))
 
+    if corruption is None:
+        mode_id = selected_fm_id
+        mode_name = selected_mode["name"]
+        reason = (
+            injection_attempts[-1].get("eligibility_reason")
+            if injection_attempts else "No eligible target was available for this failure mode."
+        )
+        return {
+            "eligible": False,
+            "skipped": True,
+            "error_type": error_type,
+            "fm_id": mode_id,
+            "fm_name": mode_name,
+            "injected_at_message_index": None,
+            "corrupted_message": None,
+            "injection": {
+                "eligible": False,
+                "eligibility_reason": reason,
+                "attempts": injection_attempts,
+            },
+            "injection_attempts": injection_attempts,
+            "injection_calls": injection_calls,
+            "baseline": None,
+            "gricean_checked": None,
+        }
+
     baseline_fork = await _apply_fork(graph, baseline_checkpoints, idx, corruption["content"], clients)
     gricean_fork = await _apply_fork(graph, gricean_checkpoints, idx, corruption["content"], clients)
 
     return {
+        "eligible": True,
+        "skipped": False,
         "error_type": error_type,
         "fm_id": corruption["fm_id"],
         "fm_name": corruption["fm_name"],
         "injected_at_message_index": idx,
         "corrupted_message": {"source": target_source, "content": corruption["content"]},
         "injection": {k: corruption.get(k) for k in ("eligible", "eligibility_reason", "prompt", "injector_response")},
+        "injection_attempts": injection_attempts,
         "injection_calls": injection_calls,
         "baseline": baseline_fork,
         "gricean_checked": gricean_fork,
