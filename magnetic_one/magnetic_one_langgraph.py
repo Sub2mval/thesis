@@ -148,9 +148,13 @@ class MagenticOneLangGraph:
             except Exception as e:
                 warnings.warn(f"Error closing agent '{name}': {e}", stacklevel=2)
 
-    def _initial_state(self, task: str, enable_gricean_check: bool, experiment_design: str = "4") -> Dict:
+    def _initial_state(
+        self, task: str, enable_gricean_check: bool, experiment_design: str = "4",
+        attachment: Optional[Dict[str, Any]] = None,
+    ) -> Dict:
         return {
             "task": task,
+            "attachment": attachment,
             "messages": [],
             "task_ledger": {},
             "n_rounds": 0,
@@ -177,6 +181,7 @@ class MagenticOneLangGraph:
         thread_id: str = "default",
         enable_gricean_check: bool = True,
         experiment_design: str = "4",
+        attachment: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         # Reset usage for this trace. The same client instance is shared by
         # the orchestrator and worker agents, so this captures the complete
@@ -187,7 +192,7 @@ class MagenticOneLangGraph:
 
         config = {"configurable": {"thread_id": thread_id}}
         result = await self.graph.ainvoke(
-            self._initial_state(task, enable_gricean_check, experiment_design), config=config
+            self._initial_state(task, enable_gricean_check, experiment_design, attachment), config=config
         )
 
         main_usage = get_usage_tracking(self.client)
@@ -222,9 +227,10 @@ class MagenticOneLangGraph:
         thread_id: str = "default",
         enable_gricean_check: bool = True,
         experiment_design: str = "4",
+        attachment: Optional[Dict[str, Any]] = None,
     ):
         config = {"configurable": {"thread_id": thread_id}}
         async for event in self.graph.astream(
-            self._initial_state(task, enable_gricean_check, experiment_design), config=config
+            self._initial_state(task, enable_gricean_check, experiment_design, attachment), config=config
         ):
             yield event
