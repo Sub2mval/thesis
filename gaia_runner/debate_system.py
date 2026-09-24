@@ -127,6 +127,8 @@ def _build_trace(
     corrupted_message: Optional[Dict[str, Any]] = None,
     started_at: Optional[str] = None,
     experiment_design: str = "4",
+    injection: Optional[Dict[str, Any]] = None,
+    injection_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     answer = final_state.get("final_answer") or ""
     extracted, correct = _score(answer, question.get("ground_truth"))
@@ -154,6 +156,8 @@ def _build_trace(
         # llm_debate-specific data with no slot in magnetic_one's schema --
         # kept under its own name rather than dropped to fit that shape.
         "agents_num": agents_num, "contexts": contexts, "adherence": final_state.get("adherence"),
+        "injection": injection,
+        "injection_calls": injection_calls or [],
     }
     if fm_id is not None:
         trace["injected_at_message_index"] = injected_at_message_index
@@ -261,31 +265,22 @@ def run_debate_error_forks(
     fork_traces: List[Dict[str, Any]] = []
     for error_type, fm_id in error_plan:
         started_at = trace_io.now_iso()
-        records: List[Dict[str, Any]] = []
-        with patched_call_llm(records):
-            pair_result = asyncio.run(run_paired_fork_experiment(
-                question["query"], cfg, question["query"], error_type, agents_num=agents_num,
-                rounds_num=rounds_num, fm_id=fm_id, strategy=strategy, attachment=attachment,
-                experiment_design=experiment_design, records=records,
-            ))
-        # Calls made producing the no-error pair vs. calls made producing
-        # the corruption + its two forked continuations are split at this
-        # boundary (see run_paired_fork_experiment's docstring), so each
-        # trace's token_stats reflects only the calls that actually
-        # belong to it rather than every call made across this whole
-        # fork iteration.
-        no_error_boundary = pair_result["no_error_call_count"] or 0
-        no_error_stats = token_usage.summarize_calls(records[:no_error_boundary])
-        # Fork traces keep the prior "combined" behavior (both sides of
-        # one fork share stats, since they fork from one shared prefix):
-        # here that's every call from the corruption onward.
-        fork_stats = token_usage.summarize_calls(records[no_error_boundary:])
+        pair_result = asyncio.run(run_paired_fork_experiment(
+            question["query"], cfg, question["query"], error_type, agents_num=agents_num,
+            rounds_num=rounds_num, fm_id=fm_id, strategy=strategy, attachment=attachment,
+            experiment_design=experiment_design, recorder_factory=patched_call_llm,
+        ))
+        no_error_stats_off = token_usage.summarize_calls(pair_result["no_error_records_off"])
+        no_error_stats_on = token_usage.summarize_calls(pair_result["no_error_records_on"])
+        error_stats_off = token_usage.summarize_calls(pair_result["error_off_records"])
+        error_stats_on = token_usage.summarize_calls(pair_result["error_on_records"])
 
-        for use_gricean_check, no_error_state in (
-            (False, pair_result["no_error_off"]), (True, pair_result["no_error_on"])
+        for use_gricean_check, no_error_state, stats in (
+            (False, pair_result["no_error_off"], no_error_stats_off),
+            (True, pair_result["no_error_on"], no_error_stats_on),
         ):
             baseline_traces.append(_build_trace(
-                question, no_error_state, no_error_stats,
+                question, no_error_state, stats,
                 agents_num=agents_num, rounds_num=rounds_num,
                 temperature=debate_config.get("temperature"), seed=debate_config.get("seed"),
                 thread_id=f"{question['task_id']}::llm_debate::"
@@ -294,14 +289,17 @@ def run_debate_error_forks(
                 experiment_design=experiment_design,
             ))
 
-        for label, result in (("checker_off", pair_result["error_off"]), ("checker_on", pair_result["error_on"])):
+        for label, result, stats in (
+            ("checker_off", pair_result["error_off"], error_stats_off),
+            ("checker_on", pair_result["error_on"], error_stats_on),
+        ):
             final_state = result["final_state"]
             agent_id, position = result["injected_at_agent_id"], result["injected_at_position"]
             msg_idx = _round_of_position(final_state["contexts"], agent_id, position) * agents_num + agent_id
             original = {"source": f"Agent{agent_id + 1}", "content": result["original_message"]}
             corrupted = {"source": f"Agent{agent_id + 1}", "content": result["corrupted_message"]}
             fork_traces.append(_build_trace(
-                question, final_state, fork_stats,
+                question, final_state, stats,
                 agents_num=agents_num, rounds_num=rounds_num,
                 temperature=debate_config.get("temperature"), seed=debate_config.get("seed"),
                 thread_id=f"{question['task_id']}::llm_debate::{label}::design{experiment_design}",
@@ -310,6 +308,7 @@ def run_debate_error_forks(
                 injected_at_step=result["injected_at_step"], injected_at_agent_id=agent_id,
                 injected_at_position=position, injected_at_node=result["injected_at_node"],
                 original_message=original, corrupted_message=corrupted, started_at=started_at,
-                experiment_design=experiment_design,
+                experiment_design=experiment_design, injection=pair_result.get("corruption"),
+                injection_calls=pair_result.get("injection_records"),
             ))
     return {"baseline_traces": baseline_traces, "fork_traces": fork_traces}
