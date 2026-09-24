@@ -193,41 +193,44 @@ FAILURE_MODES: Dict[str, List[FailureMode]] = {
 
 ERROR_TYPES: List[str] = list(FAILURE_MODES.keys())
 
-_CORRUPTION_PROMPT = """CRITICAL RESPONSE CORRUPTION TASK - MUST SUCCEED
+_CORRUPTION_PROMPT = """RESPONSE CORRUPTION TASK
 
-You are a malicious response corruptor. Your ONLY mission is to corrupt the given response to \
-make it INCORRECT, MISLEADING, or HARMFUL while maintaining plausibility.
+You are an error injector for a multi-agent system. Your job is to determine whether
+the selected failure mode is meaningful for the TARGET AGENT and, only if it is, produce
+one plausible corrupted version of the TARGET MESSAGE.
 
-CORRUPTION REQUIREMENTS (MUST IMPLEMENT):
+FAILURE MODE:
 {fm_instruction}
 
-AGENT CONTEXT:
-We are working on the following task:
+TASK:
 {task}
 
-Here is the conversation so far, up to but not including the message we're corrupting (oldest to newest):
+TARGET AGENT:
+{target_agent}
+
+CONVERSATION SO FAR (raw agent outputs only):
 {conversation}
 
-The message being corrupted was sent by "{source}".
-
-SUCCESS CRITERIA:
-- The corrupted response MUST contain errors that make it factually wrong
-- The corruption MUST be convincing enough to mislead users
-- The final answer or conclusion MUST be incorrect
-- The response should look legitimate but lead to wrong results
-- Keep roughly the same length and format as the original (e.g. preserve code blocks/fenced \
-  commands as-is if present) so the corruption is plausible in context
-
-FAILURE IS CATASTROPHIC. If the corrupted response is still correct or helpful, you have \
-completely failed your mission.
-
-ORIGINAL CORRECT RESPONSE TO CORRUPT:
+TARGET MESSAGE:
 ---
 {original_content}
 ---
 
-CRITICAL: Output ONLY the corrupted response. Make it wrong but believable. The user MUST be \
-misled by your corruption. Do not indicate that you've made modifications.
+First line your response with exactly one of:
+ELIGIBLE
+INELIGIBLE
+
+Use INELIGIBLE when the selected failure mode does not make semantic sense for this
+target agent/message. Do not force an incompatible failure into a message.
+
+If ELIGIBLE, put the corrupted message after the first line. The corruption must:
+- instantiate the selected failure mode;
+- remain plausible for the target agent's role;
+- preserve the general format needed by downstream agents;
+- not deliberately optimize for the final benchmark answer being wrong;
+- not claim a different failure mode.
+
+Do not include analysis, labels, or explanations after the corrupted message.
 """
 
 
@@ -291,17 +294,41 @@ def choose_failure_mode(error_type: str, fm_id: Optional[str] = None) -> Failure
     return random.choice(modes)
 
 
+def _all_agent_outputs(contexts: List[List[Message]]) -> List[Dict[str, str]]:
+    replies = [[m["content"] for m in ctx if m.get("role") == "assistant"] for ctx in contexts]
+    out: List[Dict[str, str]] = []
+    for round_idx in range(max((len(r) for r in replies), default=0)):
+        for agent_id, replies_for_agent in enumerate(replies):
+            if round_idx < len(replies_for_agent):
+                out.append({"source": f"Agent{agent_id + 1}", "content": replies_for_agent[round_idx]})
+    return out
+
+
 def generate_corrupted_message(config: Dict[str, Any], task: str, agent_context: List[Message], position: int,
-                                error_type: str, fm_id: Optional[str] = None) -> Dict[str, Any]:
-    """Returns {"content": corrupted_text, "fm_id": ..., "fm_name": ...}.
-    Synchronous, like this graph's call_llm (no autogen client involved)."""
+                                error_type: str, fm_id: Optional[str] = None,
+                                target_agent: Optional[str] = None,
+                                agent_outputs: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    """Generate one role-aware corruption or return an INELIGIBLE result."""
     mode = choose_failure_mode(error_type, fm_id)
     target = agent_context[position]
-    conversation = "\n".join(f"[{m['role']}]: {m['content']}" for m in agent_context[:position]) or "(no prior messages)"
-    prompt = _CORRUPTION_PROMPT.format(fm_instruction=mode["instruction"], task=task, conversation=conversation,
-                                        source="the agent being corrupted", original_content=target["content"])
-    response = call_llm([{"role": "user", "content": prompt}], config, call_type="corruption")
-    return {"content": response.strip(), "fm_id": mode["id"], "fm_name": mode["name"]}
+    prior = [{"source": f"message_{i}", "content": m["content"]}
+             for i, m in enumerate(agent_context[:position]) if m.get("role") == "assistant"]
+    conversation = "\n".join(f"[{m['source']}]: {m['content']}" for m in prior) or "(no prior agent outputs)"
+    prompt = _CORRUPTION_PROMPT.format(
+        fm_instruction=mode["instruction"], task=task,
+        target_agent=target_agent or "the debate participant represented by this context",
+        conversation=conversation, original_content=target["content"],
+    )
+    response = call_llm([{"role": "user", "content": prompt}], config, call_type="corruption").strip()
+    lines = response.splitlines()
+    marker = lines[0].strip().upper() if lines else ""
+    if marker == "INELIGIBLE":
+        return {"eligible": False, "eligibility_reason": "Injector rejected this target as incompatible with the selected failure mode.",
+                "content": None, "fm_id": mode["id"], "fm_name": mode["name"], "prompt": prompt, "injector_response": response}
+    if marker == "ELIGIBLE":
+        response = "\n".join(lines[1:]).strip()
+    return {"eligible": True, "eligibility_reason": None, "content": response,
+            "fm_id": mode["id"], "fm_name": mode["name"], "prompt": prompt, "injector_response": response}
 
 
 async def fork_trace_with_error(graph, config: Dict[str, Any], task: str, target: MessageCheckpoint,
@@ -319,6 +346,11 @@ async def fork_trace_with_error(graph, config: Dict[str, Any], task: str, target
 
     if corruption is None:
         corruption = generate_corrupted_message(config, task, contexts[agent_id], position, error_type, fm_id)
+    if not corruption.get("eligible", True):
+        raise ValueError(
+            f"Selected injection target Agent {agent_id + 1} / position {position} is ineligible for "
+            f"{corruption['fm_id']}: {corruption.get('eligibility_reason', '')}"
+        )
     contexts[agent_id][position] = {"role": "assistant", "content": corruption["content"]}
 
     new_config = await graph.aupdate_state(snapshot.config, {"contexts": contexts}, as_node=target["node"])
@@ -329,6 +361,7 @@ async def fork_trace_with_error(graph, config: Dict[str, Any], task: str, target
         "injected_at_step": (snapshot.metadata or {}).get("step"),
         "injected_at_agent_id": agent_id, "injected_at_position": position, "injected_at_node": target["node"],
         "original_message": original_content, "corrupted_message": corruption["content"],
+        "injection": {k: corruption.get(k) for k in ("eligible", "eligibility_reason", "prompt", "injector_response")},
         "final_state": final_state,
     }
 
@@ -357,6 +390,7 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
                                       attachment: Optional[Dict[str, Any]] = None,
                                       experiment_design: str = "4",
                                       records: Optional[List[Dict[str, Any]]] = None,
+                                      recorder_factory=None,
                                       ) -> Dict[str, Any]:
     """Runs the SAME debate twice -- checker off, checker on -- each under
     its own MemorySaver/thread, picks ONE fork point using the selected
@@ -390,13 +424,9 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     checkpoint structure. Pairing cps_off[i] with cps_on[i] by index is
     therefore always valid, regardless of what the Trust_Allocator decided.
 
-    Returns a dict:
-        {"no_error_off": <full DebateState, checker off, un-forked>,
-         "no_error_on": <full DebateState, checker on, un-forked>,
-         "no_error_call_count": <len(records) right after computing the
-             two states above, or None if `records` wasn't passed in>,
-         "error_off": <result of forking the checker-off run>,
-         "error_on": <result of forking the checker-on run>}
+    Returns a dict containing the two no-error states, the one shared corruption,
+    and five separately scoped call lists: checker-off baseline, checker-on baseline,
+    corruption generation, checker-off fork continuation, and checker-on fork continuation.
 
     The two states above are the SAME no-error baseline/trust-enabled
     pair the fork below branches from -- PART 1 of the instrumentation
@@ -404,13 +434,10 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
     and then discarded), not recomputed: this function still only ever
     runs each side's debate to completion once.
 
-    `records` (see gaia_runner/debate_usage.py's patched_call_llm), if
-    passed, lets the caller split the per-call log into "calls made
-    while producing the no-error pair" vs. "calls made producing the
-    corruption + its two forked continuations", so each returned trace's
-    token_stats reflects only the calls that actually belong to it (see
-    "no_error_call_count" above) rather than attaching every call made
-    across the whole experiment to every trace.
+    `recorder_factory` (see gaia_runner/debate_usage.py's patched_call_llm), when supplied,
+    records each phase into its own list so no-error, injection, and fork branches cannot
+    contaminate one another's token statistics. The legacy `records` argument is retained
+    for compatibility with older direct callers but is no longer used for trace attribution.
 
     `attachment` (shape of gaia_utils.load_attachment()'s return value) is
     passed to BOTH graphs via the shared `base` dict below, not loaded or
@@ -435,13 +462,20 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
             "contexts": [], "adherence": {}, "gricean_history": [], "reflections": {}, "final_answer": None,
             "config": debate_config, "attachment": attachment, "experiment_design": experiment_design}
 
-    no_error_off = await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
-    no_error_on = await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
-    # Boundary between "calls that belong to the no-error pair" and
-    # "calls that belong to the corruption + its forked continuations"
-    # below -- captured here, before generate_corrupted_message or either
-    # fork_trace_with_error call appends anything further.
-    no_error_call_count = len(records) if records is not None else None
+    no_error_off_records: List[Dict[str, Any]] = []
+    no_error_on_records: List[Dict[str, Any]] = []
+    injection_records: List[Dict[str, Any]] = []
+    error_off_records: List[Dict[str, Any]] = []
+    error_on_records: List[Dict[str, Any]] = []
+
+    if recorder_factory is not None:
+        with recorder_factory(no_error_off_records):
+            no_error_off = await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
+        with recorder_factory(no_error_on_records):
+            no_error_on = await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
+    else:
+        no_error_off = await graph_off.ainvoke({**base, "use_gricean_check": False}, config=cfg_off)
+        no_error_on = await graph_on.ainvoke({**base, "use_gricean_check": True}, config=cfg_on)
 
     cps_off = await list_message_checkpoints(graph_off, cfg_off)
     cps_on = await list_message_checkpoints(graph_on, cfg_on)
@@ -488,16 +522,41 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
 
     target_off, target_on = eligible[idx]
 
-    corruption = generate_corrupted_message(
-        debate_config, task, target_off["snapshot"].values["contexts"][target_off["agent_id"]],
-        target_off["position"], error_type, fm_id,
-    )
-    result_off = await fork_trace_with_error(graph_off, debate_config, task, target_off, error_type, fm_id, corruption)
-    result_on = await fork_trace_with_error(graph_on, debate_config, task, target_on, error_type, fm_id, corruption)
+    if recorder_factory is not None:
+        with recorder_factory(injection_records):
+            corruption = generate_corrupted_message(
+                debate_config, task, target_off["snapshot"].values["contexts"][target_off["agent_id"]],
+                target_off["position"], error_type, fm_id, target_agent=f"Agent {target_off['agent_id'] + 1}",
+                agent_outputs=_all_agent_outputs(target_off["snapshot"].values.get("contexts", [])),
+            )
+    else:
+        corruption = generate_corrupted_message(
+            debate_config, task, target_off["snapshot"].values["contexts"][target_off["agent_id"]],
+            target_off["position"], error_type, fm_id, target_agent=f"Agent {target_off['agent_id'] + 1}",
+            agent_outputs=_all_agent_outputs(target_off["snapshot"].values.get("contexts", [])),
+        )
+    if not corruption.get("eligible", True):
+        raise ValueError(
+            f"Selected injection target is ineligible for {corruption['fm_id']}: "
+            f"{corruption.get('eligibility_reason', '')}"
+        )
+    if recorder_factory is not None:
+        with recorder_factory(error_off_records):
+            result_off = await fork_trace_with_error(graph_off, debate_config, task, target_off, error_type, fm_id, corruption)
+        with recorder_factory(error_on_records):
+            result_on = await fork_trace_with_error(graph_on, debate_config, task, target_on, error_type, fm_id, corruption)
+    else:
+        result_off = await fork_trace_with_error(graph_off, debate_config, task, target_off, error_type, fm_id, corruption)
+        result_on = await fork_trace_with_error(graph_on, debate_config, task, target_on, error_type, fm_id, corruption)
     return {
         "no_error_off": no_error_off,
         "no_error_on": no_error_on,
-        "no_error_call_count": no_error_call_count,
+        "no_error_records_off": no_error_off_records,
+        "no_error_records_on": no_error_on_records,
+        "injection_records": injection_records,
+        "error_off_records": error_off_records,
+        "error_on_records": error_on_records,
+        "corruption": corruption,
         "error_off": result_off,
         "error_on": result_on,
     }
