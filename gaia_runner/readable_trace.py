@@ -1,221 +1,182 @@
-"""
-Reader-friendly companion file for a GAIA trace.
+"""Human-readable Markdown rendering for GAIA run traces.
 
-trace_io.save_baseline_trace / save_fork_trace each now write TWO files per
-trace: the machine-shaped trace exactly as before, and a second
-"*.readable.json" file built here -- the same run, laid out for a human to
-scroll through instead of a schema to be parsed.
-
-Shape of the readable file:
-    {<every top-level field shown in the reference trace summary --
-      task_id/system/graph/question/ground_truth/level/thread_id/condition/
-      temperature/seed/use_gricean_check/fork_condition/error_type/fm_id/
-      fm_name/experiment_design -- plus final_answer/correct>,
-     "conversation": [ ...events, oldest to newest... ]}
-
-Each event in "conversation" is one of:
-  - the seed entry: {"agent_name": "Initial Question", "agent_input": "",
-    "agent_output": <question text>}
-  - a normal turn: {"agent_name": ..., "agent_input": ..., "agent_output": ...}
-    -- one per message in trace["messages"], AND one immediately after it
-    for that message's Trust_Allocator verdict, if trace["trust_history"]
-    has an entry for that message_index. This is exactly the "question,
-    agent1, trust allocator, agent2, trust allocator, ..." order, since
-    trace["messages"] and trace["trust_history"] are both already stored
-    in generation order (see debate_system.py / magnetic_system.py). A
-    Trust_Allocator turn's agent_input spells out BOTH the task and the
-    message being evaluated, since allocate() (legacy_trust_allocator.py)
-    actually feeds it both (%%TASK%% and %%CONVERSATION%%/%%LAST_SPEAKER%%)
-    -- showing only the evaluated message here would make it look like the
-    question was withheld from the allocator, which isn't true of the
-    actual call.
-  - a corrupted-message turn, wherever trace["fork_metadata"] says a
-    message was injected: {"old_message": ..., "agent": ...,
-    "corrupters_input": ..., "error_type": ..., "corrupted_message": ...}
-    -- 5 fields, replacing the normal 3-field turn at that position, per
-    spec. "corrupters_input" is the fm_instruction text that was actually
-    fed to the corrupting model for this fm_id (looked up from
-    llm_debate.error_injection.FAILURE_MODES / magnetic_one.failure_modes.
-    FAILURE_MODES) -- the exact corruption prompt itself isn't kept in the
-    trace, but the instruction is what it was built from and is
-    deterministic per fm_id, so this is not a guess.
-
-"No \\ns": this file is for people, not parsers. format_readable() below
-deliberately turns escaped newlines back into real line breaks in the
-serialized text, which makes multi-paragraph agent output read like actual
-paragraphs instead of literal backslash-n. That makes the file technically
-invalid as strict JSON (a raw newline inside a quoted string) -- accepted
-on purpose, since the machine-readable trace already exists as the sibling
-plain .json file this one is paired with.
+The JSON trace remains authoritative. This module renders the same run as a
+chronological audit log so a person can inspect the exact prompts and outputs,
+including transient Trust Allocator notices/reflections where they were actually
+sent, without having to reverse-engineer the machine log.
 """
 
 from __future__ import annotations
 
-import json
 import os
-from typing import Any, Dict, List, Optional
-
-# Every field shown in the reference trace summary, in that same order.
-_TOP_FIELDS: List[str] = [
-    "task_id", "system", "graph", "question", "ground_truth", "level",
-    "thread_id", "condition", "temperature", "seed", "use_gricean_check",
-    "fork_condition", "error_type", "fm_id", "fm_name", "experiment_design",
-]
+from typing import Any, Dict, Iterable, List, Optional
 
 
-def _fm_instruction(system: str, error_type: Optional[str], fm_id: Optional[str]) -> Optional[str]:
-    """The corruption-requirement text actually handed to the corrupting
-    model for this fm_id (see FAILURE_MODES in llm_debate/error_injection.py
-    or magnetic_one/failure_modes.py) -- i.e. "corrupter's input". Looked
-    up rather than stored on the trace, since it's a deterministic function
-    of (system, error_type, fm_id) and both modules already expose it via
-    choose_failure_mode(). Deferred imports, same reasoning as elsewhere in
-    gaia_runner: don't force both ollama/tenacity AND autogen to be
-    installed just to write a trace for one system."""
-    if not error_type or not fm_id:
+def _md(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _call_messages(call: Dict[str, Any]) -> List[Dict[str, Any]]:
+    request = call.get("request") or {}
+    messages = request.get("messages") if isinstance(request, dict) else None
+    return messages if isinstance(messages, list) else []
+
+
+def _call_output(call: Dict[str, Any]) -> Any:
+    response = call.get("response") or {}
+    if not isinstance(response, dict):
         return None
-    try:
-        if system == "llm_debate":
-            from llm_debate.error_injection import choose_failure_mode
-        else:
-            from magnetic_one.failure_modes import choose_failure_mode
-        return choose_failure_mode(error_type, fm_id)["instruction"]
-    except Exception:
+    if response.get("generated_content") is not None:
+        return response.get("generated_content")
+    raw = response.get("raw")
+    if isinstance(raw, dict):
+        message = raw.get("message")
+        if isinstance(message, dict):
+            return message.get("content")
+    return None
+
+
+def _format_messages(messages: Iterable[Dict[str, Any]]) -> str:
+    blocks: List[str] = []
+    for i, msg in enumerate(messages, 1):
+        role = msg.get("role", "message")
+        content = msg.get("content", "")
+        blocks.append(f"**Message {i}: {role}**\n\n{_md(content)}")
+    return "\n\n".join(blocks)
+
+
+def _title_for_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[str] = None) -> str:
+    call_type = call.get("call_type", "llm_call")
+    if call_type == "trust_allocator":
+        return "Trust Allocator"
+    if call_type == "reflection":
+        return "Reflection"
+    if call_type == "corruption":
+        return "Error Injector"
+    if call_type == "aggregate":
+        return "Final aggregation"
+    if call_type == "agent_turn":
+        return agent_source or f"Agent turn {agent_index}"
+    if call_type.startswith("orchestrator_"):
+        return f"Orchestrator — {call_type}"
+    return f"LLM call — {call_type}"
+
+
+def _render_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[str] = None) -> str:
+    title = _title_for_call(call, agent_index, agent_source)
+    call_index = call.get("call_index")
+    call_type = call.get("call_type")
+    lines = [f"## {title}", ""]
+    if call_index is not None:
+        lines.append(f"Call index: `{call_index}`")
+    if call_type:
+        lines.append(f"Call type: `{call_type}`")
+    lines.append("")
+    lines.append("### Input")
+    lines.append("")
+    lines.append(_format_messages(_call_messages(call)) or "(no recorded messages)")
+    lines.append("")
+    lines.append("### Output")
+    lines.append("")
+    output = _call_output(call)
+    lines.append(_md(output) or "(no generated text recorded)")
+    return "\n".join(lines)
+
+
+def _render_injection(trace: Dict[str, Any]) -> Optional[str]:
+    injection = trace.get("injection")
+    fork = trace.get("fork_metadata") or {}
+    if not injection and not fork:
         return None
 
+    lines = ["## Error Injection", ""]
+    lines.append(f"Failure mode: `{trace.get('fm_id') or trace.get('error_type') or ''}`")
+    if trace.get("fm_name"):
+        lines.append(f"Failure name: {trace['fm_name']}")
+    if trace.get("injected_at_message_index") is not None:
+        lines.append(f"Target message index: `{trace['injected_at_message_index']}`")
+    if trace.get("target_source"):
+        lines.append(f"Target source: `{trace['target_source']}`")
+    lines.append("")
 
-def _debate_input_lookup(trace: Dict[str, Any]):
-    """llm_debate's flat trace["messages"] holds only each agent's
-    assistant replies (see debate_system._flatten_messages) -- the
-    broadcast/instruction actually fed to the agent for that turn isn't in
-    that list, but IS in trace["contexts"][agent_id] (each agent's own
-    private context: seed message, then alternating user broadcast /
-    assistant reply). This builds, per agent, the ordered list of "user
-    message immediately before this reply" pairings, then returns a
-    lookup(source) closure that walks that per-agent list in step with
-    however many times that agent's name has already been passed in --
-    which lines up exactly with encounter order in trace["messages"],
-    since each agent's own replies appear there in chronological order
-    even though interleaved with other agents' replies."""
-    contexts = trace.get("contexts") or []
-    per_agent_inputs: List[List[Optional[str]]] = []
-    for ctx in contexts:
-        inputs: List[Optional[str]] = []
-        last_user: Optional[str] = None
-        for m in ctx:
-            if m.get("role") == "user":
-                last_user = m.get("content")
-            elif m.get("role") == "assistant":
-                inputs.append(last_user)
-        per_agent_inputs.append(inputs)
+    original = fork.get("original_message") or trace.get("injection_source_message")
+    corrupted = fork.get("corrupted_message")
+    if original:
+        lines.extend(["### Original message", "", _md(original.get("content") if isinstance(original, dict) else original), ""])
+    if corrupted:
+        lines.extend(["### Corrupted message", "", _md(corrupted.get("content") if isinstance(corrupted, dict) else corrupted), ""])
 
-    counters = [0] * len(contexts)
-
-    def lookup(source: str) -> Optional[str]:
-        try:
-            agent_id = int(str(source).replace("Agent", "")) - 1
-        except ValueError:
-            return None
-        if not (0 <= agent_id < len(per_agent_inputs)):
-            return None
-        i = counters[agent_id]
-        counters[agent_id] += 1
-        inputs = per_agent_inputs[agent_id]
-        return inputs[i] if i < len(inputs) else None
-
-    return lookup
-
-
-def _trust_event(t: Dict[str, Any], evaluated_content: str, question: str) -> Dict[str, Any]:
-    level = str(t.get("trust_level") or "").upper()
-    reason = t.get("reason") or ""
-    extras = []
-    if t.get("notice_applied"):
-        extras.append(f"notice applied: {t['notice_applied']}")
-    if t.get("reflect"):
-        extras.append("reflection triggered")
-    suffix = f" ({'; '.join(extras)})" if extras else ""
-    # allocate() (trust_allocator/legacy_trust_allocator.py) fills the
-    # Trust_Allocator prompt's %%TASK%% from the original question AND
-    # %%CONVERSATION%%/%%LAST_SPEAKER%% from the message being evaluated --
-    # both go into the actual model call. Showing only the evaluated
-    # message here (as an earlier version of this file did) made it look
-    # like the question was never given to the allocator, which wasn't
-    # true of the underlying call -- just of this display. Spelling out
-    # both pieces makes that directly checkable from the file itself.
-    agent_input = f"Task (GAIA question) given to Trust_Allocator: {question}\n\nMessage being evaluated: {evaluated_content}"
-    return {
-        "agent_name": "Trust_Allocator",
-        "agent_input": agent_input,
-        "agent_output": f"{level} trust{suffix} -- {reason}".strip(),
-    }
-
-
-def _build_events(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
-    system = trace.get("system")
-    messages = trace.get("messages") or []
-    trust_by_index: Dict[int, Dict[str, Any]] = {}
-    for t in trace.get("trust_history") or []:
-        idx = t.get("message_index")
-        if idx is not None:
-            trust_by_index[idx] = t
-
-    fork_meta = trace.get("fork_metadata")
-    injected_idx = fork_meta.get("injected_at_message_index") if fork_meta else None
-    corrupters_input = (
-        _fm_instruction(system, trace.get("error_type"), (fork_meta or {}).get("fm_id") or trace.get("fm_id"))
-        if fork_meta else None
-    )
-
-    debate_input_lookup = _debate_input_lookup(trace) if system == "llm_debate" else None
-
-    events: List[Dict[str, Any]] = [
-        {"agent_name": "Initial Question", "agent_input": "", "agent_output": trace.get("question")}
-    ]
-
-    prev_output = trace.get("question")
-    for idx, msg in enumerate(messages):
-        source = msg.get("source")
-        content = msg.get("content")
-        agent_input = debate_input_lookup(source) if debate_input_lookup is not None else prev_output
-
-        if fork_meta is not None and idx == injected_idx:
-            original = fork_meta.get("original_message") or {}
-            corrupted = fork_meta.get("corrupted_message") or {}
-            events.append({
-                "old_message": original.get("content"),
-                "agent": original.get("source") or source,
-                "corrupters_input": corrupters_input,
-                "error_type": trace.get("error_type"),
-                "corrupted_message": corrupted.get("content") or content,
-            })
-        else:
-            events.append({"agent_name": source, "agent_input": agent_input, "agent_output": content})
-
-        prev_output = content
-
-        t = trust_by_index.get(idx)
-        if t is not None:
-            events.append(_trust_event(t, content, trace.get("question")))
-
-    return events
+    if injection:
+        eligible = injection.get("eligible")
+        if eligible is not None:
+            lines.append(f"Eligibility: **{'ELIGIBLE' if eligible else 'INELIGIBLE'}**")
+        if injection.get("eligibility_reason"):
+            lines.append(f"Reason: {injection['eligibility_reason']}")
+        if injection.get("prompt"):
+            lines.extend(["", "### Injector input", "", injection["prompt"]])
+        if injection.get("injector_response"):
+            lines.extend(["", "### Injector output", "", injection["injector_response"]])
+    return "\n".join(lines)
 
 
 def build_readable_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
-    readable: Dict[str, Any] = {field: trace.get(field) for field in _TOP_FIELDS}
-    readable["final_answer"] = trace.get("final_answer_extracted")
-    readable["correct"] = trace.get("correct")
-    readable["conversation"] = _build_events(trace)
-    return readable
+    """Keep the full trace available to callers; formatting is performed separately."""
+    return trace
 
 
-def format_readable(readable: Dict[str, Any]) -> str:
-    text = json.dumps(readable, indent=2, ensure_ascii=False, default=str)
-    # See module docstring's "No \ns" note -- deliberate, for humans.
-    return text.replace("\\n", "\n")
+def format_readable(trace_or_readable: Dict[str, Any]) -> str:
+    trace = trace_or_readable
+    lines = [
+        f"# {trace.get('system', 'run')}__{trace.get('condition', 'unknown')}",
+        "",
+        f"**Task ID:** `{trace.get('task_id', '')}`",
+        f"**System:** {trace.get('system', '')}",
+        f"**Graph:** {trace.get('graph', '')}",
+        f"**Condition:** `{trace.get('condition', '')}`",
+        f"**Experiment design:** `{trace.get('experiment_design', '')}`",
+        f"**Ground truth:** {trace.get('ground_truth', '')}",
+        f"**Final answer:** {trace.get('final_answer_extracted', '')}",
+        f"**Correct:** {trace.get('correct', '')}",
+        "",
+        "---",
+        "",
+        "## Initial Question",
+        "",
+        _md(trace.get("question")),
+        "",
+    ]
+
+    injection = _render_injection(trace)
+    if injection:
+        lines.extend([injection, "", "---", ""])
+
+    calls = list((trace.get("token_stats") or {}).get("calls") or [])
+    agent_index = 0
+    agent_sources = [m.get("source") for m in (trace.get("messages") or [])]
+    for call in calls:
+        agent_source = None
+        if call.get("call_type") == "agent_turn":
+            agent_source = agent_sources[agent_index] if agent_index < len(agent_sources) else None
+            agent_index += 1
+        lines.append(_render_call(call, agent_index, agent_source))
+        lines.extend(["", "---", ""])
+
+    if not calls:
+        lines.extend(["## Recorded messages", "", "No raw call records were stored for this trace.", ""])
+
+    lines.extend([
+        "## Final Result",
+        "",
+        f"**Answer:** {trace.get('final_answer_extracted', '')}",
+        f"**Correct:** {trace.get('correct', '')}",
+        "",
+    ])
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def write_readable_trace(path: str, trace: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write(format_readable(build_readable_trace(trace)))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(format_readable(trace))
