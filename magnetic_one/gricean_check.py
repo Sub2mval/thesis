@@ -107,20 +107,29 @@ We are working on the following task:
 %%TASK%%
 Here is the conversation so far (oldest to newest):
 %%CONVERSATION%%
-Focus ONLY on the LAST message. In this system, agents operate under a Cooperative Principle:
-they must make contributions required by the accepted purpose of the exchange. Because autonomous
-agents struggle to infer hidden meanings, any violation of conversational maxims drastically
-reduces the reliability of the message.
+Evaluate ONLY the LAST message, but use the TASK and prior raw agent outputs as evidence needed
+to determine whether that message is reliable. The target message is the only message being scored;
+the surrounding task and prior outputs are context for judging it.
+
+In this system, agents operate under a Cooperative Principle: they must make contributions required
+by the accepted purpose of the exchange. Evaluate the target message against the task as a whole, not
+just for local plausibility or internal consistency. A message can contain individually true statements
+and still be unreliable if it ignores a task-relevant condition, makes an invalid inference, answers
+a different question, or reaches a conclusion that does not follow from the task and available evidence.
+Before assigning scores, independently check the target message's reasoning and whether it uses the
+task information needed to support its conclusion.
+
 Evaluate the message holistically using the following Gricean criteria:
-1. **Quality (Evidence & Calibration)** - Does the agent avoid saying things that are demonstrably false? Does it possess adequate evidence for its claims? (e.g., separating confirmed tool outputs from unverified hypotheses).
-2. **Quantity (Information Density)** - Is the contribution exactly as informative as required? Does it provide the necessary details for the next agent without polluting the context with over-informative, irrelevant text?
-3. **Relation (Role Relevance)** - Is the message strictly relevant to the current stage of the orchestration or debate? Does the agent stay within its assigned role?
-4. **Manner (Clarity & Order)** - Does the agent avoid obscurity and ambiguity? Is the output perfectly orderly and actionable (e.g., correct syntax, clear instructions, no formatting errors)?
-When assigning scores, prioritize whether a downstream agent could safely rely on the message
-to make decisions. Factual errors, unsupported claims, logical flaws, contradictions with prior
-context, missing evidence, ambiguous specifications, misleading reasoning, or attempts to derail
-the discussion should substantially reduce the scores. Minor grammatical or stylistic issues should
-have little effect unless they impair understanding.
+1. **Quality (Evidence, Truth & Logical Validity)** - Are the message's factual claims supported by the task or evidence available to the agent? Does its reasoning correctly connect those facts to its conclusion? Mark down messages that ignore, misinterpret, or fail to apply a task-relevant condition, even when individual statements are true. Also consider calibration: unsupported certainty, contradictions, and misleading claims should reduce the score.
+2. **Quantity (Completeness & Relevance)** - Does the message provide enough information for the next agent to correctly act on the task, including reasoning or evidence needed to understand its conclusion? Mark down omissions that make a required inference impossible to verify, but do not reward unnecessary repetition, restatement, or verbosity. More information is not better if it does not help the next agent solve the task.
+3. **Relation (Task & Role Relevance)** - Does the message address the task and the target agent's current role or stage of the orchestration? Mark down answers that solve a different problem, follow an irrelevant line of reasoning, introduce unrelated material, or step outside the role in a way that makes the contribution less useful. Relevant critique, verification, disagreement, or tool output should not be penalized merely because it differs from the current consensus.
+4. **Manner (Clarity, Structure & Interpretability)** - Is the message expressed clearly enough for a downstream agent to understand what is being claimed, why it follows, and what should be relied upon? Mark down ambiguity, disordered reasoning, unclear references, contradictory statements, or formatting that obscures the operational meaning. Clear presentation does not compensate for missing or invalid reasoning.
+When assigning scores, prioritize whether a downstream agent could safely rely on the message to make
+decisions. Factual errors, unsupported claims, invalid reasoning, contradictions with prior context,
+ignored task requirements, missing information needed to verify the conclusion, ambiguous specifications,
+misleading reasoning, irrelevant content, or attempts to derail the discussion should substantially
+reduce the relevant scores. Minor grammatical or stylistic issues should have little effect unless
+they impair understanding or actionability.
 
 CRITICAL EXCEPTIONS - DO NOT PENALIZE THE FOLLOWING:
 1. Veridical Error Reporting (The "Stack Trace" Exception): If the message contains a runtime error, stack trace, or states that a tool failed, this observes the Maxim of Quality perfectly. Truthfully reporting a failure is exactly what is required -- the downstream agent MUST trust the error message as ground truth in order to debug it. Do not conflate "the code failed" with "the message is unreliable."
