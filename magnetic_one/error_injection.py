@@ -23,41 +23,47 @@ from magnetic_one.context_utils import ORCHESTRATOR_NAME
 from magnetic_one.failure_modes import ERROR_TYPES, choose_failure_mode
 from magnetic_one.state import ThreadMessage
 
-_CORRUPTION_PROMPT = """CRITICAL RESPONSE CORRUPTION TASK - MUST SUCCEED
+_CORRUPTION_PROMPT = """RESPONSE CORRUPTION TASK
 
-You are a malicious response corruptor. Your ONLY mission is to corrupt the given response to \
-make it INCORRECT, MISLEADING, or HARMFUL while maintaining plausibility.
+You are an error injector for a multi-agent system. First determine whether the
+selected failure mode is meaningful for the TARGET AGENT and TARGET MESSAGE. Only
+if it is meaningful should you produce a corrupted message.
 
-CORRUPTION REQUIREMENTS (MUST IMPLEMENT):
+FAILURE MODE:
 {fm_instruction}
 
-AGENT CONTEXT:
-We are working on the following task:
+TASK:
 {task}
 
-Here is the conversation so far, up to but not including the message we're corrupting (oldest to newest):
+TARGET AGENT / ROLE:
+{target_agent}
+
+CONVERSATION SO FAR (raw messages only, before the target message):
 {conversation}
 
-The message being corrupted was sent by "{source}".
-
-SUCCESS CRITERIA:
-- The corrupted response MUST contain errors that make it factually wrong
-- The corruption MUST be convincing enough to mislead users
-- The final answer or conclusion MUST be incorrect
-- The response should look legitimate but lead to wrong results
-- Keep roughly the same length and format as the original (e.g. preserve code blocks/fenced \
-  commands as-is if present) so the corruption is plausible in context
-
-FAILURE IS CATASTROPHIC. If the corrupted response is still correct or helpful, you have \
-completely failed your mission.
-
-ORIGINAL CORRECT RESPONSE TO CORRUPT:
+TARGET MESSAGE:
 ---
 {original_content}
 ---
 
-CRITICAL: Output ONLY the corrupted response. Make it wrong but believable. The user MUST be \
-misled by your corruption. Do not indicate that you've made modifications.
+First line your response with exactly one of:
+ELIGIBLE
+INELIGIBLE
+
+Use INELIGIBLE when this failure mode does not make semantic sense for this
+target agent/message or cannot meaningfully affect the target's contribution to
+the task. Do not force an incompatible failure into a tool result, status message,
+or other output that cannot meaningfully exhibit the failure.
+
+If ELIGIBLE, put exactly one plausible corrupted version of the target message
+after the first line. The corruption must:
+- instantiate the selected failure mode;
+- remain plausible for the target agent's role;
+- preserve the general format needed by downstream agents;
+- not deliberately optimize for the final benchmark answer being wrong;
+- not introduce a different failure mode.
+
+Do not include analysis, labels, or explanations after the corrupted message.
 """
 
 
@@ -112,8 +118,9 @@ async def generate_corrupted_message(
     target_index: int,
     error_type: str,
     fm_id: Optional[str] = None,
+    target_role: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Returns {"content": corrupted_text, "fm_id": ..., "fm_name": ...}."""
+    """Generate one role-aware corruption or return an INELIGIBLE result."""
     mode = choose_failure_mode(error_type, fm_id)
     target = messages[target_index]
     prior = messages[:target_index]
@@ -121,8 +128,8 @@ async def generate_corrupted_message(
     prompt = _CORRUPTION_PROMPT.format(
         fm_instruction=mode["instruction"],
         task=task,
+        target_agent=target_role or target["source"],
         conversation=conversation,
-        source=target["source"],
         original_content=target["content"],
     )
     # call_type="corruption" (PART 8) -- instrumentation-only label; see
@@ -133,7 +140,30 @@ async def generate_corrupted_message(
         extra_create_args={"call_type": "corruption"},
     )
     assert isinstance(response.content, str)
-    return {"content": response.content.strip(), "fm_id": mode["id"], "fm_name": mode["name"]}
+    raw = response.content.strip()
+    lines = raw.splitlines()
+    marker = lines[0].strip().upper() if lines else ""
+    if marker == "INELIGIBLE":
+        return {
+            "eligible": False,
+            "eligibility_reason": "Injector rejected this target as incompatible with the selected failure mode.",
+            "content": None,
+            "fm_id": mode["id"],
+            "fm_name": mode["name"],
+            "prompt": prompt,
+            "injector_response": raw,
+        }
+    if marker == "ELIGIBLE":
+        raw = "\n".join(lines[1:]).strip()
+    return {
+        "eligible": True,
+        "eligibility_reason": None,
+        "content": raw,
+        "fm_id": mode["id"],
+        "fm_name": mode["name"],
+        "prompt": prompt,
+        "injector_response": response.content.strip(),
+    }
 
 
 async def fork_trace_with_error(
@@ -156,6 +186,11 @@ async def fork_trace_with_error(
     original_source = messages[target_message_index]["source"]
 
     corruption = await generate_corrupted_message(model_client, task, messages, target_message_index, error_type, fm_id)
+    if not corruption.get("eligible", True):
+        raise ValueError(
+            f"Selected injection target {original_source} / message {target_message_index} is ineligible for "
+            f"{corruption['fm_id']}: {corruption.get('eligibility_reason', '')}"
+        )
     corrupted_messages = list(messages)
     corrupted_messages[target_message_index] = {"source": original_source, "content": corruption["content"]}
 
@@ -171,6 +206,7 @@ async def fork_trace_with_error(
         "injected_at_node": chosen["node"],
         "original_message": {"source": original_source, "content": original_content},
         "corrupted_message": {"source": original_source, "content": corruption["content"]},
+        "injection": {k: corruption.get(k) for k in ("eligible", "eligibility_reason", "prompt", "injector_response")},
         "final_state": final_state,
     }
 
