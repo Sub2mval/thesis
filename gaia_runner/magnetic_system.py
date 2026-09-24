@@ -293,6 +293,12 @@ def run_magnetic_error_forks(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
             error_type, ORCHESTRATOR_NAME, fm_id=fm_id, strategy=strategy, usage_clients=usage_clients,
         ))
+        if fork.get("skipped") or not fork.get("baseline") or not fork.get("gricean_checked"):
+            # The error injector judged every candidate target semantically
+            # ineligible. This is a valid experimental outcome, not a graph
+            # error, so keep the no-error pair and move to the next planned
+            # injection/design instead of trying to inject None.
+            continue
         stats_by_side = {
             "checker_off": _combined_usage_from_calls(fork["baseline"].get("calls", [])),
             "checker_on": _combined_usage_from_calls(fork["gricean_checked"].get("calls", [])),
