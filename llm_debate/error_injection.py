@@ -300,13 +300,27 @@ def choose_failure_mode(error_type: str, fm_id: Optional[str] = None) -> Failure
 
 
 def _all_agent_outputs(contexts: List[List[Message]]) -> List[Dict[str, str]]:
-    replies = [[m["content"] for m in ctx if m.get("role") == "assistant"] for ctx in contexts]
+    replies = [[m.get("content") for m in ctx if m.get("role") == "assistant" and isinstance(m.get("content"), str)] for ctx in contexts]
     out: List[Dict[str, str]] = []
     for round_idx in range(max((len(r) for r in replies), default=0)):
         for agent_id, replies_for_agent in enumerate(replies):
             if round_idx < len(replies_for_agent):
                 out.append({"source": f"Agent{agent_id + 1}", "content": replies_for_agent[round_idx]})
     return out
+
+
+def _format_raw_messages(messages: List[Message], source_prefix: str = "message") -> str:
+    """Format raw assistant messages without assuming a `source` field exists."""
+    parts: List[str] = []
+    for i, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        source = message.get("source") or f"{source_prefix}_{i}"
+        parts.append(f"[{source}]: {content}")
+    return "\n".join(parts) or "(no prior agent outputs)"
 
 
 def generate_corrupted_message(config: Dict[str, Any], task: str, agent_context: List[Message], position: int,
@@ -317,29 +331,55 @@ def generate_corrupted_message(config: Dict[str, Any], task: str, agent_context:
     """Generate one role-aware corruption or return an INELIGIBLE result."""
     mode = choose_failure_mode(error_type, fm_id)
     target = agent_context[position]
-    prior = [{"source": f"message_{i}", "content": m["content"]}
-             for i, m in enumerate(agent_context[:position]) if m.get("role") == "assistant"]
-    conversation = "\n".join(f"[{m['source']}]: {m['content']}" for m in prior) or "(no prior agent outputs)"
+    target_content = target.get("content")
+    if not isinstance(target_content, str):
+        return {
+            "eligible": False,
+            "eligibility_reason": "Target message has no textual content to corrupt.",
+            "content": None,
+            "fm_id": mode["id"],
+            "fm_name": mode["name"],
+            "prompt": None,
+            "injector_response": "INELIGIBLE",
+        }
+    conversation = _format_raw_messages(agent_context[:position])
     paired_section = ""
     if comparison_context is not None:
+        if position >= len(comparison_context):
+            return {
+                "eligible": False,
+                "eligibility_reason": "Comparison trace has no message at the candidate position.",
+                "content": None,
+                "fm_id": mode["id"],
+                "fm_name": mode["name"],
+                "prompt": None,
+                "injector_response": "INELIGIBLE",
+            }
         paired_target = comparison_context[position]
-        paired_prior = comparison_context[:position]
-        paired_conversation = (
-            "\n".join(f"[{m['source']}]: {m['content']}" for m in paired_prior)
-            or "(no prior agent outputs)"
-        )
+        paired_target_content = paired_target.get("content")
+        if not isinstance(paired_target_content, str):
+            return {
+                "eligible": False,
+                "eligibility_reason": "Comparison target message has no textual content to corrupt.",
+                "content": None,
+                "fm_id": mode["id"],
+                "fm_name": mode["name"],
+                "prompt": None,
+                "injector_response": "INELIGIBLE",
+            }
+        paired_conversation = _format_raw_messages(comparison_context[:position], source_prefix="comparison_message")
         paired_section = (
             "COMPARISON TRACE (Trace B, same candidate position):\n"
             f"CONVERSATION SO FAR:\n{paired_conversation}\n\n"
             "TARGET MESSAGE (Trace B):\n---\n"
-            f"{paired_target['content']}\n---\n\n"
+            f"{paired_target_content}\n---\n\n"
             "The corruption will be injected into BOTH Trace A and Trace B. "
             "It must therefore be semantically valid for both target messages."
         )
     prompt = _CORRUPTION_PROMPT.format(
         fm_instruction=mode["instruction"], task=task,
         target_agent=target_agent or "the debate participant represented by this context",
-        conversation=conversation, original_content=target["content"],
+        conversation=conversation, original_content=target_content,
         paired_section=paired_section,
     )
     response = call_llm([{"role": "user", "content": prompt}], config, call_type="corruption").strip()
