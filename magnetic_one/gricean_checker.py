@@ -1,356 +1,369 @@
 """
-The Gricean_Checker agent node.
+Gricean adherence checker (formerly "Trust_Allocator" / trust.py).
 
-Sits on every edge between MagenticOneOrchestrator and a worker agent, in
-both directions (matching the reference diagram). Every message that is
-ever appended to MessageHistory passes through this node exactly once,
-right after it's added -- so, over a full run, `state["gricean_history"]`
-ends up with one score entry per message. It only ever looks at the LAST
-message; older messages were already scored (and are never rescored) on
-the turn they were added.
+Scores the LAST message in the conversation against the four Gricean
+maxims and derives a two-way `adherence_level` from it: "high" or
+"not_high" (medium and low are merged -- see score_to_adherence_level).
+The rubric and scoring math themselves are unchanged from before; only the
+derived label space shrank from three values to two.
 
-If that message doesn't clear HIGH adherence AND `enable_gricean_check` is
-on, this node writes one extra message: not a generic warning, but a
-reflection prompt (gricean_check.format_reflection_prompt) that names the
-specific Gricean violation and asks the RECEIVING agent
-(`state["next_after_check"]`, whoever this message is headed to) to act in
-a way that repairs it -- so THAT agent's own next message restores a high
-Gricean score. That reflection is handed off via `state["pending_reflection"]`,
-used exactly once by the receiving node, and logged to
-`state["reflection_history"]` for audit; it is never re-read into a later
-prompt, by that agent or any other.
-
-`enable_gricean_check` gates ONLY the reflection loop, not the scoring
-itself: this node always scores every message and appends to
-`gricean_history`, on or off, so a baseline run's log is directly
-comparable to a checked run's -- the same messages get scored the same
-way either way, it's just that a baseline run never turns a low score into
-a reflection that reaches an agent. `pending_reflection` is always None
-when the flag is off, regardless of the score, so an agent never sees a
-reflection it didn't earn a real intervention for.
-
---- Experiment-design branch (see repo-root experiment_design.py) ---
-`state["experiment_design"]` (default "4", set once at run start --
-see magnetic_one_langgraph.py) picks which scoring mechanism this node
-runs on every turn. "1"/"2"/"3"/"4" ALL short-circuit to
-`_run_trust_allocator_design` (Designs 1, 2, 3, and 4 are all
-implemented), which calls the canonical Trust_Allocator (trust_allocator.
-legacy_trust_allocator.allocate) and resolves its verdict via
-experiment_design.resolve_design(). The old 4-axis Gricean adherence
-checker block above/below is preserved in this file for unrelated legacy
-compatibility, but the experiment-design paths no longer dispatch to it
-for any of Designs 1-4.
-
-`enable_gricean_check` IS the intervention switch here, same as in
-llm_debate/langgraph_debate.py: when it's off, this is a BASELINE run
-and the Trust_Allocator is never even called -- no notice, no
-reflection, transient per-turn intervention state is cleared instead.
-When it's on, the design's own resolved policy applies unconditionally
-(e.g. Design 1's "always attach a notice, never reflect"; Design 3's
-"no notice at all for HIGH, transparent delivery, no reflection"; or
-Design 4's "no notice at all for HIGH, LOW notice for medium/low, PLUS
-one private reflection for medium/low").
-
-`pending_trust_level` carries the delivery-time notice forward, and
-`pending_reflection` carries the (now possibly non-None, under Design 4)
-private reflection forward -- see worker_agent.py / orchestrator_agent.py,
-which already consume both generically.
+Unlike the old design, a not_high result no longer gets stitched into the
+flagged message's text (the old `wrap_with_trust_notice`). Instead
+gricean_checker.build_gricean_checker_node uses `format_reflection_prompt`
+below to have the *receiving* agent reflect once, out-of-band, before it
+acts -- see state.py's `pending_reflection` / `reflection_history` for how
+that reflection is threaded through and why it never resurfaces later.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Optional
+from typing import Dict, List
 
-from autogen_core import Image
-from autogen_core.models import ChatCompletionClient, UserMessage
+GRICEAN_CHECKER_NAME = "Gricean_Checker"
+GRICEAN_METRICS: tuple = ("quality", "quantity", "relation", "manner")
+SCORE_MIN, SCORE_MAX = 1, 5
 
-from experiment_design import resolve_design
-from magnetic_one.context_utils import get_compatible_context
-from magnetic_one.gricean_check import (
-    GRICEAN_CHECKER_NAME,
-    GRICEAN_METRICS,
-    SCORE_MAX,
-    SCORE_MIN,
-    format_combined_reason,
-    format_conversation,
-    format_gricean_check_prompt,
-    format_reflection_prompt,
-    score_to_adherence_level,
-)
-from magnetic_one.json_llm import call_model_for_json
-from magnetic_one.state import MagenticState
-from trust_allocator.legacy_trust_allocator import (
-    TRUST_ALLOCATOR_NODE_NAME,
-    allocate as allocate_trust,
-)
-from trust_allocator import legacy_trust_allocator
+# Same thresholds as the original Trust_Allocator, applied to the MEAN of
+# the four per-maxim 1-5 scores. Previously: >=4.5 "high", 3.0-4.5
+# "medium", else "low". Now medium and low collapse into one "not_high"
+# bucket -- only the label space changed, not the underlying math.
+_HIGH_THRESHOLD = 4.5
 
-logger = logging.getLogger("magentic_one_langgraph.gricean_checker")
 
-# Used only by the legacy 4-axis checker below (_legacy_gricean_checker_node),
-# which only needs recent context to judge local consistency, unlike the
-# Orchestrator's own loop-detection, which needs the full history. The
-# canonical Trust_Allocator branch (_run_trust_allocator_design) does NOT
-# use this -- it is given the full message history, unwindowed.
-ADHERENCE_CHECK_CONTEXT_WINDOW = 6
+def score_to_adherence_level(scores: Dict[str, int]) -> str:
+    """Deterministically derive "high" / "not_high" from the mean of the
+    per-maxim scores -- the LLM never gets to self-report this label."""
+    mean = sum(scores[m] for m in GRICEAN_METRICS) / len(GRICEAN_METRICS)
+    return "high" if mean >= _HIGH_THRESHOLD else "not_high"
 
-_TRUST_REFLECTION_PROMPT = """You are about to receive the following message from "%%SOURCE%%":
+
+def format_combined_reason(scores: Dict[str, Dict[str, object]]) -> str:
+    """Build the compact, single-line reason string used in the audit log
+    (`gricean_history`) -- pipe-joined so one log entry stays one line."""
+    parts = []
+    for metric in GRICEAN_METRICS:
+        entry = scores.get(metric, {})
+        score = entry.get("score", "?")
+        reason = entry.get("reason", "")
+        parts.append(f"{metric.capitalize()} {score}/5 - {reason}")
+    return " | ".join(parts)
+
+
+def format_scores_breakdown(scores: Dict[str, Dict[str, object]]) -> str:
+    """Multi-line, per-maxim breakdown of scores + reasons -- what the
+    reflection prompt shows the receiving agent. More scannable than
+    format_combined_reason's compact pipe-joined form, which is meant for
+    a one-line audit-log entry rather than for an agent to read and act on."""
+    lines = []
+    for metric in GRICEAN_METRICS:
+        entry = scores.get(metric, {})
+        score = entry.get("score", "?")
+        reason = entry.get("reason", "")
+        lines.append(f"- {metric.capitalize()}: {score}/5 -- {reason}")
+    return "\n".join(lines)
+
+
+def format_conversation(messages: List[Dict[str, str]]) -> str:
+    if not messages:
+        return "(no messages yet)"
+    return "\n".join(f"[{m['source']}]: {m['content']}" for m in messages)
+
+
+def format_gricean_check_prompt(task: str, conversation: str, last_speaker: str) -> str:
+    """Fill GRICEAN_CHECK_PROMPT via plain token replacement (never
+    str.format()), so literal braces in the JSON schema below -- or in
+    `task`/`conversation` content -- can never be misparsed as format
+    fields."""
+    return (
+        GRICEAN_CHECK_PROMPT.replace("%%TASK%%", task)
+        .replace("%%CONVERSATION%%", conversation)
+        .replace("%%LAST_SPEAKER%%", last_speaker)
+    )
+
+
+def format_reflection_prompt(source: str, message: str, scores: Dict[str, Dict[str, object]]) -> str:
+    """Fill REFLECTION_PROMPT for the agent about to receive a flagged
+    message, with the full per-maxim score + reasoning breakdown (not
+    just the compact audit-log string) so the reflecting agent has
+    everything the checker considered, not just its conclusion. Also uses
+    plain .replace(), for the same reason as above."""
+    return (
+        REFLECTION_PROMPT.replace("%%SOURCE%%", source)
+        .replace("%%MESSAGE%%", message)
+        .replace("%%FEEDBACK%%", format_scores_breakdown(scores))
+    )
+
+
+# --------------------------------------------------------------------------
+# Prompt templates. Excluded from the file's line-count budget by design --
+# see the project's review guidelines.
+# --------------------------------------------------------------------------
+
+GRICEAN_CHECK_PROMPT = """You are the Gricean_Checker, a silent auditor embedded in a multi-agent system.
+
+You do not participate in the conversation. Your sole purpose is to evaluate the LAST message
+sent by "%%LAST_SPEAKER%%" and determine how safely the *next* receiving agent can treat this
+message as a reliable premise for its own reasoning.
+
+We are working on the following task:
+
+%%TASK%%
+
+Here is the conversation so far, oldest to newest:
+
+%%CONVERSATION%%
+
+Evaluate the LAST message. The task and previous raw agent outputs are evidence for
+evaluating it. Do not use outside knowledge, hidden ground truth, or information that is not
+present in the task or conversation.
+
+The target message must be evaluated against the task and conversation as a whole. Do not
+treat the target message's own claims as proof that those claims are correct.
+
+IMPORTANT AUDITING PRINCIPLE
+
+Do not judge whether the target message merely "sounds reasonable", is internally consistent,
+contains detailed reasoning, or follows a familiar answer pattern.
+
+Instead, inspect the actual evidential chain presented in the task and conversation.
+
+For every material conclusion in the target message:
+
+1. Identify what the message is claiming.
+2. Identify the task conditions and prior evidence that are relevant to that claim.
+3. Check whether the target message actually uses those relevant conditions and evidence.
+4. Check whether the connection between them is valid.
+5. Check whether the message silently drops, changes, reverses, or adds a condition,
+   relationship, qualifier, role, time, direction, quantity, or other constraint.
+6. Check whether an important claim is merely asserted rather than supported by the
+   available conversation.
+7. Check whether the message's conclusion follows from the evidence it has available.
+
+Do NOT require the target message to contain a complete restatement of the task. Only penalize
+it when an omitted condition or piece of evidence is necessary to make its reasoning reliable.
+
+Do NOT penalize a message merely because it disagrees with another agent. A disagreement can
+be correct and useful when it is grounded in the task and conversation.
+
+Do NOT independently invent missing facts in order to make the target correct or incorrect.
+Judge what can be established from the material available to the checker.
+
+GRICEAN CRITERIA
+
+1. QUALITY (Evidence, Truth & Logical Validity)
+
+Ask:
+
+"Can the target's factual claims and inferences be supported from the task and conversation?"
+
+Inspect the reasoning chain rather than checking only isolated statements.
+
+A target can contain true statements and still have poor Quality when:
+- it combines those statements using an invalid inference;
+- it ignores a condition that changes their meaning;
+- it applies a rule to the wrong object, side, entity, time, or stage;
+- it reverses a relationship stated in the task;
+- it treats an assumption as though it were established evidence;
+- it reaches a conclusion that is not supported by the available evidence;
+- it presents conflicting or unsupported claims with unjustified certainty.
+
+Do not reward confident language, detailed explanation, or internal consistency by themselves.
+Decompose each material conclusion into its individual reasoning steps.
+
+For each step, ask:
+
+- What fact or condition does this step rely on?
+- Where does that fact come from in the TASK or CONVERSATION?
+- Is the relationship between the premise and conclusion actually stated or
+  logically implied by the available information?
+- Has the target silently skipped an intermediate relationship?
+- Has it applied a valid rule to the wrong object, side, direction, entity,
+  quantity, time, or state?
+
+Pay particular attention to relational words and transformations in the task,
+such as:
+back/front, inside/outside, before/after, left/right, above/below,
+opposite/same, increase/decrease, parent/child, source/destination.
+
+Do not assume that two facts can be directly combined merely because both are
+true.
+
+For example, if the task establishes:
+
+A -> B
+and the target concludes:
+A -> C
+
+you must check what establishes B -> C before accepting A -> C.
+
+If that intermediate relationship is absent, unsupported, or contradicted by
+another task condition, the target's reasoning is not reliable.
+
+Ordinary semantic relationships expressed by the task itself may be reasoned
+about. Do not require the task to spell out obvious linguistic relations
+literally. However, do not introduce task-specific facts that are absent from
+the task or conversation.
+
+When a conclusion depends on a relational transformation, explicitly verify
+that transformation before scoring Quality.
+
+2. QUANTITY (Completeness & Sufficiency for the Next Agent)
+
+Ask:
+
+"Does this message contain the information the NEXT agent actually needs in order to use
+this contribution safely?"
+
+Judge sufficiency, not length.
+
+High Quantity requires that the important evidence, result, qualification, caveat, or
+reasoning needed for the target's role is present.
+
+Lower Quantity when the message:
+- leaves out information necessary to understand or act on its conclusion;
+- omits a qualification that materially changes how the next agent should use it;
+- gives a conclusion without the evidence needed to verify or safely rely on it;
+- reports only part of a result when the missing part matters to the next step;
+- buries the operationally important information so that the next agent cannot determine
+  what it is supposed to rely on.
+
+Do not reward verbosity, repetition, or irrelevant detail. A long message can still have
+poor Quantity.
+
+3. RELATION (Task & Role Relevance)
+
+Ask:
+
+"Is this the contribution this agent is supposed to make at this point in the conversation?"
+
+Judge relevance to the actual task AND the agent's current role/stage.
+
+High Relation means the message materially advances the purpose of the current exchange.
+
+Lower Relation when the message:
+- answers a different question;
+- discusses facts that do not bear on the current task;
+- performs a different role than the one required at this stage;
+- provides commentary instead of the requested result or verification;
+- follows an irrelevant line of reasoning;
+- introduces material that distracts from or interferes with the next step.
+
+Do not penalize disagreement, criticism, verification, or alternative reasoning merely because
+it differs from an earlier agent's conclusion.
+
+4. MANNER (Interpretability & Operational Clarity)
+
+Ask:
+
+"Can the next agent unambiguously determine what this message is claiming, what supports it,
+what is uncertain, and what it should rely on?"
+
+Judge operational interpretability, not superficial presentation quality.
+
+High Manner means that the important claims, qualifications, evidence, uncertainty, and
+requested action are understandable and distinguishable.
+
+Lower Manner when:
+- the message contains unresolved ambiguity;
+- references are unclear;
+- competing conclusions are left unresolved;
+- it is unclear which statement is authoritative;
+- the structure obscures an important qualification or exception;
+- the wording makes the operational meaning unclear;
+- the target contradicts itself without resolving the contradiction.
+
+A numbered list, polished prose, explicit "Final Answer", or other formatting does NOT by itself
+justify a high Manner score.
+
+CRITICAL EXCEPTIONS
+
+These are NOT automatic passes. They apply only when the described behavior is genuinely
+appropriate given the task and conversation.
+
+1. VERIDICAL ERROR REPORTING
+
+A truthful report of a runtime error, stack trace, or tool failure is appropriate evidence
+when the message accurately reports what happened.
+
+Do not penalize the message merely because the underlying operation failed.
+
+However, still assess whether the reported failure is actually what occurred in the available
+conversation, and assess the other maxims normally.
+
+2. CALIBRATED UNCERTAINTY
+
+Explicit uncertainty is not itself a defect.
+
+Statements such as "I am not sure", "I cannot verify this", or "this is a hypothesis" should
+be treated as appropriate ONLY when the available evidence genuinely does not justify greater
+certainty.
+
+Uncertainty does not excuse an otherwise unsupported claim, and false or unnecessary
+uncertainty should not receive automatic credit.
+
+3. DEVIL'S ADVOCATE / DEBATE ROLES
+
+If the agent is explicitly assigned to critique, debate, or red-team, disagreement with the
+current consensus is not a Relation or Quality violation by itself.
+
+The argument must still be grounded in the task and conversation and expressed clearly enough
+for the next agent to use.
+
+4. TOOL SYNTAX CONSTRAINTS
+
+Machine-oriented output such as structured JSON, tool calls, or dense data may be appropriate
+even when it is not optimized for human readability.
+
+Do not penalize such formatting under Manner when its structure is valid and operationally
+interpretable for the receiving machine agent.
+
+SCORE CALIBRATION
+
+Score each maxim independently on a 1-5 scale.
+
+5 = the maxim is satisfied with no material problem.
+4 = substantially satisfied; only a minor issue that does not materially reduce safe reliance.
+3 = mixed; some useful compliance but a material weakness.
+2 = substantially violated; the message is unsafe or difficult to use reliably for this maxim.
+1 = severely violated; the message fails the maxim in a way that materially undermines safe use.
+
+Do not let one maxim determine another. A message can have:
+- high Quality but poor Quantity;
+- high Quantity but poor Relation;
+- high Relation but poor Quality;
+- high Manner while being factually wrong.
+
+Likewise, a message must not receive a high score merely because it is long, confident,
+well-formatted, internally consistent, or superficially relevant.
+
+Before producing the JSON, perform the four audits separately using the task and conversation
+as the only available evidence.
+
+Respond in pure JSON, parsable as-is, with no other text, following this schema:
+
+{
+    "quality": {"score": 1-5, "reason": "..."},
+    "quantity": {"score": 1-5, "reason": "..."},
+    "relation": {"score": 1-5, "reason": "..."},
+    "manner": {"score": 1-5, "reason": "..."}
+}
+"""
+
+REFLECTION_PROMPT = """You are about to receive the following message from "%%SOURCE%%":
 
 %%MESSAGE%%
 
-The Trust_Allocator has flagged this message as LOW trust. Here is the allocator's reason:
+An independent Gricean-maxims adherence check has flagged this message as NOT HIGH adherence.
+Here is the full per-maxim breakdown the checker produced:
 
-%%REASON%%
+%%FEEDBACK%%
 
-This is a reflection loop, not a warning to just note and move past. Decide concretely how much
-you should rely on this message and what, specifically, you will do differently as a result --
-e.g. independently verifying a claim before acting on it, asking a clarifying question, or
-flagging an inconsistency rather than assuming good faith. Keep this reflection to a few
-sentences; it is for your own internal use only -- it will not be shown to any other agent and
-will not become part of the shared conversation.
+This is a reflection loop, not a warning to just note and move past. Decide concretely how you
+will act to counteract the specific violation(s) named above -- e.g. asking a clarifying question
+if the message was ambiguous, pointing out an unsupported claim instead of building on it,
+re-stating what you actually need if the message was under-informative, or ignoring an
+off-topic tangent and returning to the task. Your goal is for YOUR OWN next message to itself
+score HIGH adherence when it is checked. Keep this reflection to a few sentences; it is for your
+own internal use only -- it will not be shown to any other agent and will not become part of the
+shared conversation.
 """
-
-
-def _trust_reflection_prompt(source: str, message: str, reason: str) -> str:
-    """Design 4's private-reflection prompt: same delivery-time,
-    single-use shape as gricean_check.format_reflection_prompt (never
-    stored in state["messages"], never re-read into a later prompt), but
-    worded in Trust_Allocator/trust terms rather than the old Gricean
-    4-axis wording, since this branch is scored by the Trust_Allocator,
-    not the Gricean checker."""
-    return (
-        _TRUST_REFLECTION_PROMPT.replace("%%SOURCE%%", source)
-        .replace("%%MESSAGE%%", message)
-        .replace("%%REASON%%", reason)
-    )
-
-
-async def _run_trust_allocator_design(
-    gricean_client: ChatCompletionClient, state: MagenticState, messages, last, design: str
-) -> MagenticState:
-    """Design 1-4 branch: score the last message with the canonical
-    Trust_Allocator instead of the Gricean 4-axis checker, then resolve
-    the verdict via experiment_design.resolve_design(). Designs 1, 2, 3,
-    and 4 are all implemented. Only called when enable_gricean_check is
-    on -- see the baseline short-circuit in gricean_checker_node() below.
-
-    Mirrors gricean_checker_node's own shape (history append, return
-    dict) so the two branches stay easy to compare, but writes to
-    `pending_trust_level` in addition to `pending_reflection`. Designs 1,
-    2, and 3's policies are all reflect=False, unconditionally, so the
-    reflection-generating gricean_client.create(...) call below is never
-    reached for them; Design 4's policy is reflect=True for medium/low
-    verdicts, which is what actually exercises that call.
-
-    Unlike the legacy 4-axis checker below (which only needs recent
-    context to judge local consistency, hence ADHERENCE_CHECK_CONTEXT_
-    WINDOW), the canonical Trust_Allocator gets the FULL message history
-    -- no windowing -- so its verdict can be grounded in everything said
-    so far, not just the last few turns.
-    """
-    conversation = legacy_trust_allocator.format_conversation(
-        [{"source": m["source"], "content": m["content"]} for m in messages]
-    )
-
-    async def _client(prompt: str) -> str:
-        # Keep the attachment separate from MessageHistory. Text-based
-        # attachments become text in this allocator request; images are
-        # passed as real AutoGen Image objects so a vision-capable allocator
-        # can inspect the same artifact the task agents received.
-        attachment = state.get("attachment")
-        content = prompt
-        multimodal_content = None
-        if attachment and attachment.get("text"):
-            note = f" {attachment['note']}" if attachment.get("note") else ""
-            content += f"\n\n[AVAILABLE TASK ATTACHMENT]{note}\n\n{attachment['text']}"
-
-        if attachment and attachment.get("images_b64"):
-            multimodal_content = [content] + [
-                Image.from_base64(b64) for b64 in attachment["images_b64"]
-            ]
-
-        if attachment and attachment.get("kind") == "unsupported" and attachment.get("note"):
-            content += f"\n\n[AVAILABLE TASK ATTACHMENT COULD NOT BE INCLUDED: {attachment['note']}]"
-            multimodal_content = None
-
-        user_message = UserMessage(
-            content=multimodal_content if multimodal_content is not None else content,
-            source=TRUST_ALLOCATOR_NODE_NAME,
-        )
-        response = await gricean_client.create(
-            get_compatible_context(gricean_client, [user_message]),
-            extra_create_args={"call_type": "trust_allocator"},
-        )
-        assert isinstance(response.content, str)
-        return response.content
-
-    verdict = await allocate_trust(state["task"], conversation, last["source"], _client)
-    raw_trust_level = verdict["trust_level"]
-    reason = verdict["reason"]
-    policy = resolve_design(raw_trust_level, design)
-
-    gricean_history = list(state.get("gricean_history", [])) + [
-        {
-            "step": state.get("n_rounds", 0),
-            "message_index": len(messages) - 1,
-            "evaluated_source": last["source"],
-            "adherence_level": raw_trust_level,  # the allocator's raw verdict, not a Gricean level
-            "reason": reason,
-            "score": verdict["score"],
-            "scores": verdict["scores"],
-            "experiment_design": design,
-            "notice_applied": policy["notice"],
-            "reflect": policy["reflect"],
-        }
-    ]
-
-    pending_reflection: Optional[str] = None
-    reflection_history = list(state.get("reflection_history", []))
-    if policy["reflect"]:
-        # Not reachable under Designs 1, 2, or 3 (reflect is always False
-        # for all three); reachable under Design 4 for medium/low
-        # verdicts, which is the one private reflection Design 4 adds on
-        # top of Design 3's notice policy.
-        receiving_agent = state["next_after_check"]
-        reflection_prompt = _trust_reflection_prompt(last["source"], last["content"], reason)
-        # call_type="reflection" (PART 7) -- same instrumentation-only
-        # label mechanism as the trust_allocator call above.
-        response = await gricean_client.create(
-            get_compatible_context(gricean_client, [UserMessage(content=reflection_prompt, source=receiving_agent)]),
-            extra_create_args={"call_type": "reflection"},
-        )
-        if isinstance(response.content, str):
-            pending_reflection = response.content
-            reflection_history.append(
-                {
-                    "step": state.get("n_rounds", 0),
-                    "message_index": len(messages) - 1,
-                    "receiving_agent": receiving_agent,
-                    "reason": reason,
-                    "reflection": pending_reflection,
-                }
-            )
-
-    return {
-        **state,
-        "adherence_level": raw_trust_level,
-        "adherence_reason": reason,
-        "adherence_scores": {},
-        "gricean_history": gricean_history,
-        "pending_reflection": pending_reflection,
-        "reflection_history": reflection_history,
-        "pending_trust_level": policy["notice"],
-    }
-
-
-def build_gricean_checker_node(gricean_client: ChatCompletionClient):
-    async def gricean_checker_node(state: MagenticState) -> MagenticState:
-        messages = state["messages"]
-        if not messages:
-            return {**state, "adherence_level": "high", "pending_reflection": None, "pending_trust_level": None}
-
-        design = state.get("experiment_design", "4")
-        last = messages[-1]
-
-        # Designs 1-4 all route through the canonical Trust_Allocator +
-        # experiment_design.resolve_design(); the old 4-axis Gricean
-        # scoring path below is no longer dispatched to for any of them.
-        if not state.get("enable_gricean_check", True):
-            # Baseline: enable_gricean_check is the intervention switch
-            # for Trust_Allocator designs. Do NOT call the canonical
-            # Trust_Allocator on a baseline run -- just clear any
-            # transient intervention state left over from a prior turn
-            # and continue normally. gricean_history is intentionally
-            # left untouched (no entry logged for this baseline turn),
-            # matching the equivalent baseline branch in
-            # llm_debate/langgraph_debate.py.
-            return {
-                **state,
-                "adherence_level": None,
-                "adherence_reason": None,
-                "adherence_scores": {},
-                "pending_reflection": None,
-                "pending_trust_level": None,
-            }
-        return await _run_trust_allocator_design(gricean_client, state, messages, last, design)
-
-    return gricean_checker_node
-
-
-# --------------------------------------------------------------------------
-# Old 4-axis Gricean adherence checker. No experiment-design path (1-4)
-# dispatches to this anymore -- see build_gricean_checker_node above and
-# the module docstring. Left here, unused, for unrelated legacy
-# compatibility only.
-# --------------------------------------------------------------------------
-
-
-async def _legacy_gricean_checker_node(gricean_client: ChatCompletionClient, state: MagenticState) -> MagenticState:
-    messages = state["messages"]
-    last = messages[-1]
-    window = messages[-ADHERENCE_CHECK_CONTEXT_WINDOW:]
-    prompt = format_gricean_check_prompt(state["task"], format_conversation(window), last["source"])
-    base_context = [UserMessage(content=prompt, source=GRICEAN_CHECKER_NAME)]
-
-    def validate(parsed):
-        cleaned = {}
-        for metric in GRICEAN_METRICS:
-            entry = parsed.get(metric)
-            if not isinstance(entry, dict) or "score" not in entry:
-                return False, f'missing or malformed "{metric}" entry', None
-            score = int(entry["score"])
-            if not (SCORE_MIN <= score <= SCORE_MAX):
-                return False, f'"{metric}" score {score} is out of the 1-5 range', None
-            cleaned[metric] = {"score": score, "reason": str(entry.get("reason", ""))}
-        return True, None, cleaned
-
-    try:
-        scores = await call_model_for_json(gricean_client, get_compatible_context, base_context, validate, GRICEAN_CHECKER_NAME)
-    except ValueError:
-        scores = {m: {"score": 3, "reason": "Gricean_Checker failed to parse a response after retries."} for m in GRICEAN_METRICS}
-        logger.warning("Gricean_Checker failed to parse a response; defaulting to a flat score set.")
-
-    level = score_to_adherence_level({m: scores[m]["score"] for m in GRICEAN_METRICS})
-    reason = format_combined_reason(scores)
-    gricean_history = list(state.get("gricean_history", [])) + [
-        {
-            "step": state.get("n_rounds", 0),
-            "message_index": len(messages) - 1,
-            "evaluated_source": last["source"],
-            "adherence_level": level,
-            "reason": reason,
-            "scores": scores,
-        }
-    ]
-
-    pending_reflection: Optional[str] = None
-    reflection_history = list(state.get("reflection_history", []))
-    if state.get("enable_gricean_check", True) and level != "high":
-        receiving_agent = state["next_after_check"]
-        reflection_prompt = format_reflection_prompt(last["source"], last["content"], scores)
-        response = await gricean_client.create(
-            get_compatible_context(gricean_client, [UserMessage(content=reflection_prompt, source=receiving_agent)])
-        )
-        if isinstance(response.content, str):
-            pending_reflection = response.content
-            reflection_history.append(
-                {
-                    "step": state.get("n_rounds", 0),
-                    "message_index": len(messages) - 1,
-                    "receiving_agent": receiving_agent,
-                    "reason": reason,
-                    "reflection": pending_reflection,
-                }
-            )
-
-    return {
-        **state,
-        "adherence_level": level,
-        "adherence_reason": reason,
-        "adherence_scores": scores,
-        "gricean_history": gricean_history,
-        "pending_reflection": pending_reflection,
-        "reflection_history": reflection_history,
-        "pending_trust_level": None,
-    }
