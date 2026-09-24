@@ -169,6 +169,45 @@ A target can contain true statements and still have poor Quality when:
 
 Do not reward confident language, detailed explanation, or internal consistency by themselves.
 
+Decompose each material conclusion into its individual reasoning steps.
+
+For each step, ask:
+
+- What fact or condition does this step rely on?
+- Where does that fact come from in the TASK or CONVERSATION?
+- Is the relationship between the premise and conclusion actually stated or
+  logically implied by the available information?
+- Has the target silently skipped an intermediate relationship?
+- Has it applied a valid rule to the wrong object, side, direction, entity,
+  quantity, time, or state?
+
+Pay particular attention to relational words and transformations in the task,
+such as:
+back/front, inside/outside, before/after, left/right, above/below,
+opposite/same, increase/decrease, parent/child, source/destination.
+
+Do not assume that two facts can be directly combined merely because both are
+true.
+
+For example, if the task establishes:
+
+A -> B
+and the target concludes:
+A -> C
+
+you must check what establishes B -> C before accepting A -> C.
+
+If that intermediate relationship is absent, unsupported, or contradicted by
+another task condition, the target's reasoning is not reliable.
+
+Ordinary semantic relationships expressed by the task itself may be reasoned
+about. Do not require the task to spell out obvious linguistic relations
+literally. However, do not introduce task-specific facts that are absent from
+the task or conversation.
+
+When a conclusion depends on a relational transformation, explicitly verify
+that transformation before scoring Quality.
+
 2. QUANTITY (Completeness & Sufficiency for the Next Agent)
 
 Ask:
