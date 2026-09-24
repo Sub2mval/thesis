@@ -62,6 +62,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from autogen_core import Image
 from autogen_core.models import ChatCompletionClient, UserMessage
 
 from experiment_design import resolve_design
@@ -153,14 +154,32 @@ async def _run_trust_allocator_design(
     )
 
     async def _client(prompt: str) -> str:
-        # call_type="trust_allocator" (PART 6) -- extra_create_args is a
-        # normal, already-supported create() parameter; the instrumented
-        # client pops this label out before forwarding the rest to the
-        # real Ollama API (see ollama_client.py's module docstring).
+        # Keep the attachment separate from MessageHistory. Text-based
+        # attachments become text in this allocator request; images are
+        # passed as real AutoGen Image objects so a vision-capable allocator
+        # can inspect the same artifact the task agents received.
+        attachment = state.get("attachment")
+        content = prompt
+        multimodal_content = None
+        if attachment and attachment.get("text"):
+            note = f" {attachment['note']}" if attachment.get("note") else ""
+            content += f"\n\n[AVAILABLE TASK ATTACHMENT]{note}\n\n{attachment['text']}"
+
+        if attachment and attachment.get("images_b64"):
+            multimodal_content = [content] + [
+                Image.from_base64(b64) for b64 in attachment["images_b64"]
+            ]
+
+        if attachment and attachment.get("kind") == "unsupported" and attachment.get("note"):
+            content += f"\n\n[AVAILABLE TASK ATTACHMENT COULD NOT BE INCLUDED: {attachment['note']}]"
+            multimodal_content = None
+
+        user_message = UserMessage(
+            content=multimodal_content if multimodal_content is not None else content,
+            source=TRUST_ALLOCATOR_NODE_NAME,
+        )
         response = await gricean_client.create(
-            get_compatible_context(
-                gricean_client, [UserMessage(content=prompt, source=TRUST_ALLOCATOR_NODE_NAME)]
-            ),
+            get_compatible_context(gricean_client, [user_message]),
             extra_create_args={"call_type": "trust_allocator"},
         )
         assert isinstance(response.content, str)
