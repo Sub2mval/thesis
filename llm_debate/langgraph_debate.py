@@ -176,6 +176,25 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
     return {"role": "user", "content": "\n".join(parts)}, flagged
 
 
+def _raw_broadcast(others: List[Tuple[int, List[Message]]], question: str) -> Message:
+    """Build the same broadcast without any transient Trust notice."""
+    message, _ = construct_broadcast(others, question, -1, {}, "4")
+    return message
+
+
+def _canonical_agent_outputs(contexts: List[List[Message]], agents_num: int) -> List[Dict[str, str]]:
+    """Return only raw assistant outputs, in turn order. Prompt/notice text
+    from an agent's private context is deliberately excluded from the
+    Trust_Allocator evidence packet."""
+    replies = [[m["content"] for m in ctx if m.get("role") == "assistant"] for ctx in contexts]
+    out: List[Dict[str, str]] = []
+    for round_idx in range(max((len(r) for r in replies), default=0)):
+        for agent_id in range(agents_num):
+            if round_idx < len(replies[agent_id]):
+                out.append({"source": f"Agent{agent_id + 1}", "content": replies[agent_id][round_idx]})
+    return out
+
+
 def _reflection_prompt(query: str, flagged: List[Tuple[int, str, str]]) -> str:
     blocks = "\n\n".join(
         f"Flagged message from Agent {aid + 1}:\n```{content}```\nTrust_Allocator's reason for the LOW-trust verdict: {reason}"
@@ -274,7 +293,13 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         # branch in magnetic_one for the matching enforcement there.
         visible_adherence = state["adherence"] if state["use_gricean_check"] else {}
         broadcast, flagged = construct_broadcast(others, state["query"], -1, visible_adherence, design)
-        contexts[i].append(broadcast)
+        # Store only the raw broadcast. Trust notices are delivery-time metadata
+        # and must never become part of the agent's persistent context.
+        raw_broadcast = _raw_broadcast(others, state["query"])
+        contexts[i].append(raw_broadcast)
+        delivered_broadcast = broadcast
+    else:
+        delivered_broadcast = None
 
     reflections = {k: list(v) for k, v in state["reflections"].items()}
     extra: List[Message] = []
@@ -293,7 +318,10 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         extra = [{"role": "user", "content": f"[Private reflection -- not part of the shared conversation]\n"
                                               f"{reflection}\n\nNow give your updated answer to the task."}]
 
-    reply = call_llm(contexts[i] + extra, state["config"], call_type="agent_turn")
+    turn_context = list(contexts[i])
+    if delivered_broadcast is not None:
+        turn_context[-1] = delivered_broadcast
+    reply = call_llm(turn_context + extra, state["config"], call_type="agent_turn")
     contexts[i].append({"role": "assistant", "content": reply})
     next_i = (i + 1) % state["agents_num"]
     return {"contexts": contexts, "agent_idx": next_i, "round": r + 1 if next_i == 0 else r,
@@ -319,7 +347,7 @@ async def _trust_allocator_check(state: DebateState, speaker: int, ctx: List[Mes
     called when use_gricean_check is on -- see the baseline short-circuit
     in gricean_check() below."""
     design = state["experiment_design"]
-    conversation = format_conversation([{"source": m["role"], "content": m["content"]} for m in ctx])
+    conversation = format_conversation(_canonical_agent_outputs(state["contexts"], state["agents_num"]))
     verdict = await allocate_trust(
         state["query"], conversation, f"Agent {speaker + 1}", _debate_client_for_allocator(state["config"])
     )
