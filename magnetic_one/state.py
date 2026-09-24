@@ -87,6 +87,8 @@ class TokenUsageSummary(TypedDict, total=False):
 
 class MagenticState(TypedDict, total=False):
     task: str
+    # Canonical GAIA attachment payload for this run; kept separate from MessageHistory.
+    attachment: Optional[Dict[str, Any]]
     team_description: str
     participant_names: List[str]
 
