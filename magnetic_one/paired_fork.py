@@ -44,6 +44,7 @@ from autogen_core.models import ChatCompletionClient
 
 from magnetic_one.error_injection import generate_corrupted_message, list_message_checkpoints
 from magnetic_one.state import ThreadMessage
+from magnetic_one.ollama_client import get_usage_tracking
 
 try:  # only needed for the type hint; avoids a hard import cycle at runtime
     from magnetic_one.magnetic_one_langgraph import MagenticOneLangGraph
@@ -158,7 +159,16 @@ async def run_paired_traces(
     }
 
 
-async def _apply_fork(graph, checkpoints, target_index: int, corrupted_content: str) -> Dict[str, Any]:
+def _usage_calls(clients: List[Any]) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    for client in clients:
+        calls.extend(list(get_usage_tracking(client).get("calls", [])))
+    calls.sort(key=lambda r: (r.get("started_at_unix", 0), r.get("call_index", 0)))
+    return calls
+
+
+async def _apply_fork(graph, checkpoints, target_index: int, corrupted_content: str,
+                      usage_clients: Optional[List[Any]] = None) -> Dict[str, Any]:
     matches = [c for c in checkpoints if c["message_index"] == target_index]
     if not matches:
         raise ValueError(f"No checkpoint found writing message index {target_index}.")
@@ -169,13 +179,21 @@ async def _apply_fork(graph, checkpoints, target_index: int, corrupted_content: 
     original = messages[target_index]
     messages[target_index] = {"source": original["source"], "content": corrupted_content}
 
+    clients = usage_clients or []
+    before_by_client = [list(get_usage_tracking(client).get("calls", [])) for client in clients]
     new_config = await graph.aupdate_state(snapshot.config, {"messages": messages}, as_node=chosen["node"])
     final_state = await graph.ainvoke(None, config=new_config)
+    branch_calls: List[Dict[str, Any]] = []
+    for client, before in zip(clients, before_by_client):
+        after = list(get_usage_tracking(client).get("calls", []))
+        branch_calls.extend(after[len(before):])
+    branch_calls.sort(key=lambda r: (r.get("started_at_unix", 0), r.get("call_index", 0)))
     return {
         "injected_at_step": (snapshot.metadata or {}).get("step"),
         "injected_at_node": chosen["node"],
         "original_message": original,
         "final_state": final_state,
+        "calls": branch_calls,
     }
 
 
@@ -190,6 +208,7 @@ async def fork_paired_traces_with_error(
     fm_id: Optional[str] = None,
     strategy: str = "middle_agent_message",
     target_message_index: Optional[int] = None,
+    usage_clients: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """Fork the SAME already-completed baseline and Gricean-checked runs
     (same `graph` -- one compiled graph serves both, distinguished only by
@@ -214,17 +233,30 @@ async def fork_paired_traces_with_error(
     # Generate the corruption ONCE, off the shared (hence identical-either-
     # way) prefix, so both forks get the exact same corrupted text rather
     # than two independently-sampled corruptions.
-    corruption = await generate_corrupted_message(model_client, task, baseline_messages, idx, error_type, fm_id)
+    clients = usage_clients or [model_client]
+    before_injection = [list(get_usage_tracking(client).get("calls", [])) for client in clients]
+    target_source = baseline_messages[idx]["source"]
+    corruption = await generate_corrupted_message(
+        model_client, task, baseline_messages, idx, error_type, fm_id,
+        target_role=target_source,
+    )
+    injection_calls: List[Dict[str, Any]] = []
+    for client, before in zip(clients, before_injection):
+        after = list(get_usage_tracking(client).get("calls", []))
+        injection_calls.extend(after[len(before):])
+    injection_calls.sort(key=lambda r: (r.get("started_at_unix", 0), r.get("call_index", 0)))
 
-    baseline_fork = await _apply_fork(graph, baseline_checkpoints, idx, corruption["content"])
-    gricean_fork = await _apply_fork(graph, gricean_checkpoints, idx, corruption["content"])
+    baseline_fork = await _apply_fork(graph, baseline_checkpoints, idx, corruption["content"], clients)
+    gricean_fork = await _apply_fork(graph, gricean_checkpoints, idx, corruption["content"], clients)
 
     return {
         "error_type": error_type,
         "fm_id": corruption["fm_id"],
         "fm_name": corruption["fm_name"],
         "injected_at_message_index": idx,
-        "corrupted_message": {"source": baseline_messages[idx]["source"], "content": corruption["content"]},
+        "corrupted_message": {"source": target_source, "content": corruption["content"]},
+        "injection": {k: corruption.get(k) for k in ("eligible", "eligibility_reason", "prompt", "injector_response")},
+        "injection_calls": injection_calls,
         "baseline": baseline_fork,
         "gricean_checked": gricean_fork,
     }
