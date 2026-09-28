@@ -34,6 +34,7 @@ from autogen_core.models import AssistantMessage, ChatCompletionClient, LLMMessa
 from autogen_ext.models.ollama import OllamaChatCompletionClient
 
 from gaia_runner.serialization import to_jsonsafe
+from magnetic_one.model_info import lookup_model_info
 from gaia_runner import trace_io
 
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
@@ -80,8 +81,10 @@ class InstrumentedOllamaChatCompletionClient:
         host: Optional[str] = None,
         key_identifier: Optional[str] = None,
         generation_options: Optional[Dict[str, Any]] = None,
+        provider: str = "ollama",
     ):
         self._client = client
+        self._provider = provider
         self._records = []
         self._call_index = 0
         # Metadata about THIS client instance (one model/host/key per
@@ -140,7 +143,7 @@ class InstrumentedOllamaChatCompletionClient:
             "call_type": call_type,
             "started_at": started_iso,
             "started_at_unix": started,
-            "provider": "ollama",
+            "provider": self._provider,
             "model": self._model,
             "host": self._host,
             "key_identifier": self._key_identifier,
@@ -306,6 +309,8 @@ def build_ollama_client(
 ) -> ChatCompletionClient:
     """Build a ChatCompletionClient pointed at a local Ollama server."""
     merged_options = _merge_options(temperature, seed, options)
+    if model_info is None:
+        model_info = lookup_model_info(model)
     try:
         if model_info is not None:
             return InstrumentedOllamaChatCompletionClient(

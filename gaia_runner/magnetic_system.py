@@ -37,10 +37,15 @@ GAIA_FINAL_ANSWER_PROMPT = ORCHESTRATOR_FINAL_ANSWER_PROMPT + "\n" + gaia_utils.
 
 def build_magnetic_system(
     model: str, gricean_model: Optional[str], host: str,
-    api_keys: Optional[List[str]] = None, **kwargs: Any,
+    api_keys: Optional[List[str]] = None, openrouter: bool = False, **kwargs: Any,
 ) -> MagenticOneLangGraph:
     """Pass `api_keys` (e.g. loaded from OLLAMA_API_KEY_1..N) to route through
     Ollama Cloud with key rotation instead of a single local/cloud client."""
+    if api_keys and openrouter:
+        return MagenticOneLangGraph.from_openrouter(
+            model=model, api_keys=api_keys, host=host, gricean_model=gricean_model,
+            final_answer_prompt=GAIA_FINAL_ANSWER_PROMPT, **kwargs,
+        )
     if api_keys:
         return MagenticOneLangGraph.from_ollama_cloud(
             model=model, api_keys=api_keys, host=host, gricean_model=gricean_model,

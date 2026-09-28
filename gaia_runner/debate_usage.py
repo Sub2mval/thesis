@@ -80,7 +80,8 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
         key_index = next((i for i, m in enumerate(model_list) if m is model), None)
         headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
         host = model.get("host", "http://localhost:11434")
-        client = ollama.Client(host=host, headers=headers)
+        is_openrouter = model.get("provider") == "openrouter"
+        client = None if is_openrouter else ollama.Client(host=host, headers=headers)
         options = {k: v for k, v in (("temperature", config.get("temperature")),
                                       ("num_predict", config.get("max_tokens")),
                                       ("seed", config.get("seed"))) if v is not None}
@@ -103,7 +104,7 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
             "call_type": call_type,  # "agent_turn" | "reflection" | "trust_allocator" | "aggregate" | "corruption"
             "started_at": started_iso,
             "started_at_unix": started,
-            "provider": "ollama",
+            "provider": "openrouter" if is_openrouter else "ollama",
             "model": model.get("model"),
             "host": host,
             "key_identifier": mask_api_key(model.get("api_key"), key_index),
@@ -116,7 +117,10 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
             "context": model.get("model"),
         }
         try:
-            resp = client.chat(model=model["model"], messages=messages, options=options)
+            if is_openrouter:
+                resp = langgraph_debate.openrouter_chat(model, messages, config)
+            else:
+                resp = client.chat(model=model["model"], messages=messages, options=options)
             finished = time.time()
             message_obj = _field(resp, "message")
             content = _field(message_obj, "content") if message_obj is not None else None

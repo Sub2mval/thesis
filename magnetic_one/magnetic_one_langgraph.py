@@ -22,6 +22,7 @@ from autogen_ext.code_executors import create_default_code_executor
 from magnetic_one.context_utils import make_autogen_agent_caller
 from magnetic_one.ollama_client import build_ollama_client, get_usage_tracking, reset_usage_tracking
 from magnetic_one.ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, RotatingKeyOllamaClient
+from magnetic_one.openrouter_client import DEFAULT_OPENROUTER_HOST, build_rotating_openrouter_client
 from magnetic_one.orchestrator_graph import build_magentic_one_graph
 from magnetic_one.prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
 
@@ -124,6 +125,21 @@ class MagenticOneLangGraph:
             RotatingKeyOllamaClient(model=gricean_model, api_keys=api_keys, host=host)
             if gricean_model else None
         )
+        return cls(client=client, gricean_model_client=gricean_client, **kwargs)
+
+    @classmethod
+    def from_openrouter(
+        cls,
+        model: str,
+        api_keys: list,
+        host: str = DEFAULT_OPENROUTER_HOST,
+        gricean_model: Optional[str] = None,
+        model_info: Optional[dict] = None,
+        **kwargs,
+    ) -> "MagenticOneLangGraph":
+        """Same as from_ollama_cloud(), but via OpenRouter (OR_Key_N keys)."""
+        client = build_rotating_openrouter_client(model, api_keys, host, model_info)
+        gricean_client = build_rotating_openrouter_client(gricean_model, api_keys, host) if gricean_model else None
         return cls(client=client, gricean_model_client=gricean_client, **kwargs)
 
     def _validate_client_capabilities(self, client: ChatCompletionClient) -> None:

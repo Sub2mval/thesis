@@ -104,11 +104,41 @@ Message = Dict[str, Any]  # role/content, plus optionally images/audio for attac
 # per-call basis, so N keys in model_list gives free random load-spreading
 # across them via the random.choice() above. Falls back to whatever
 # OLLAMA_API_KEY env var is set (or no auth) when `api_key` is absent.
+def openrouter_chat(model: Dict[str, Any], messages: List[Message], config: Dict[str, Any]) -> Dict[str, Any]:
+    """OpenRouter (OpenAI-compatible) chat call for a model_list entry with
+    provider == "openrouter". Same temperature/seed/max_tokens handling as the
+    Ollama path; returns an ollama-shaped dict so callers can treat both alike."""
+    from openai import OpenAI
+    oa_messages = []
+    for m in messages:
+        if m.get("images"):
+            parts = [{"type": "text", "text": m["content"]}] + [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}} for b in m["images"]]
+            oa_messages.append({"role": m["role"], "content": parts})
+        else:
+            oa_messages.append({"role": m["role"], "content": m["content"]})
+    kwargs = {k: v for k, v in (("temperature", config.get("temperature")),
+                                ("max_tokens", config.get("max_tokens")),
+                                ("seed", config.get("seed"))) if v is not None}
+    client = OpenAI(base_url=model.get("host", "https://openrouter.ai/api/v1"), api_key=model["api_key"])
+    resp = client.chat.completions.create(model=model["model"], messages=oa_messages, **kwargs)
+    choice = resp.choices[0]
+    usage = getattr(resp, "usage", None)
+    return {
+        "message": {"content": choice.message.content or ""},
+        "prompt_eval_count": getattr(usage, "prompt_tokens", None),
+        "eval_count": getattr(usage, "completion_tokens", None),
+        "done": True, "done_reason": choice.finish_reason, "model": resp.model,
+    }
+
+
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def call_llm(messages: List[Message], config: Dict[str, Any], call_type: str = "unknown") -> str:
     # call_type is purely a label for instrumentation (see gaia_runner/debate_usage.py) --
     # it has no effect on model selection or the request itself.
     model = random.choice(config["model_list"])
+    if model.get("provider") == "openrouter":
+        return openrouter_chat(model, messages, config)["message"]["content"]
     headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
     client = ollama.Client(host=model.get("host", "http://localhost:11434"), headers=headers)
     options = {k: v for k, v in (("temperature", config.get("temperature")),

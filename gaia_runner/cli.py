@@ -33,6 +33,7 @@ from .question_select import select_questions
 from . import trace_io
 
 DEFAULT_OLLAMA_CLOUD_HOST = "https://ollama.com"
+DEFAULT_OPENROUTER_HOST = "https://openrouter.ai/api/v1"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -80,10 +81,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "and rotates across them for both systems. Overrides --debate-host/--magnetic-host "
                          "with --ollama-cloud-host.")
     p.add_argument("--ollama-cloud-host", default=DEFAULT_OLLAMA_CLOUD_HOST)
+    p.add_argument("--openrouter", action="store_true",
+                    help="Use OpenRouter instead of Ollama: loads OR_Key_1..OR_Key_N (and a bare OR_Key, if set) "
+                         "from the environment/.env and rotates across them for both systems, with the same "
+                         "temperature=0 / --seed defaults. Uses --openrouter-model for both systems "
+                         "(and --gricean-model, if given, as an OpenRouter slug).")
+    p.add_argument("--openrouter-model", default="google/gemma-4-31b-it")
+    p.add_argument("--openrouter-host", default=DEFAULT_OPENROUTER_HOST)
     return p
 
 
 def _debate_model_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    if args.openrouter:
+        from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
+        keys = load_api_keys_from_env(prefix="OR_Key")
+        return [{"model": args.openrouter_model, "host": args.openrouter_host, "api_key": k, "provider": "openrouter"}
+                for k in keys]
     if not args.ollama_cloud:
         return [{"model": args.debate_model, "host": args.debate_host}]
     from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
@@ -128,7 +141,13 @@ def _run_magnetic(
     question: Dict[str, Any], args: argparse.Namespace, error_plan, out_dir: str, experiment_design: str
 ) -> List[Dict[str, Any]]:
     from . import magnetic_system  # deferred: keeps a debate-only run from needing autogen installed
-    if args.ollama_cloud:
+    if args.openrouter:
+        from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
+        keys = load_api_keys_from_env(prefix="OR_Key")
+        magentic = magnetic_system.build_magnetic_system(
+            args.openrouter_model, args.gricean_model, args.openrouter_host, api_keys=keys, openrouter=True,
+        )
+    elif args.ollama_cloud:
         from magnetic_one.ollama_cloud_client import load_api_keys_from_env  # deferred: see import note above
         keys = load_api_keys_from_env(prefix="OLLAMA_API_KEY")
         magentic = magnetic_system.build_magnetic_system(
@@ -180,6 +199,8 @@ def _selected_designs(experiment_design: str) -> List[str]:
 def main(argv: List[str] = None) -> None:
     from dotenv import load_dotenv
     args = build_arg_parser().parse_args(argv)
+    if args.openrouter and args.ollama_cloud:
+        raise SystemExit("--openrouter and --ollama-cloud are mutually exclusive.")
     task_ids = args.task_ids.split(",") if args.task_ids else None
     error_plan = resolve_error_plan(family=args.error_family, fm_id=args.error_type)
 
