@@ -1,0 +1,8 @@
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "llm_debate", "kind": "baseline", "condition": false, "error_type": null, "fm_id": null, "correct": false, "total_tokens": 17889}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "llm_debate", "kind": "baseline", "condition": true, "error_type": null, "fm_id": null, "correct": false, "total_tokens": 41545}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "llm_debate", "kind": "fork", "condition": "checker_off", "error_type": "inter_agent_misalignment", "fm_id": "FM-2.1", "correct": false, "total_tokens": 14336}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "llm_debate", "kind": "fork", "condition": "checker_on", "error_type": "inter_agent_misalignment", "fm_id": "FM-2.1", "correct": false, "total_tokens": 35961}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "magnetic_one", "kind": "baseline", "condition": false, "error_type": null, "fm_id": null, "correct": false, "total_tokens": 18044}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "magnetic_one", "kind": "baseline", "condition": true, "error_type": null, "fm_id": null, "correct": false, "total_tokens": 49874}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "magnetic_one", "kind": "fork", "condition": "checker_off", "error_type": "inter_agent_misalignment", "fm_id": "FM-2.1", "correct": false, "total_tokens": 63337}
+{"task_id": "4d51c4bf-4b0e-4f3d-897b-3f6687a7d9f2", "system": "magnetic_one", "kind": "fork", "condition": "checker_on", "error_type": "inter_agent_misalignment", "fm_id": "FM-2.1", "correct": false, "total_tokens": 63337}
