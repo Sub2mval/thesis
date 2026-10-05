@@ -64,6 +64,8 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import ollama
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from . import gaia_utils
+
 from langgraph.graph import END, START, StateGraph
 
 from .Gricean_check import (
@@ -104,32 +106,80 @@ Message = Dict[str, Any]  # role/content, plus optionally images/audio for attac
 # per-call basis, so N keys in model_list gives free random load-spreading
 # across them via the random.choice() above. Falls back to whatever
 # OLLAMA_API_KEY env var is set (or no auth) when `api_key` is absent.
-def openrouter_chat(model: Dict[str, Any], messages: List[Message], config: Dict[str, Any]) -> Dict[str, Any]:
-    """OpenRouter (OpenAI-compatible) chat call for a model_list entry with
-    provider == "openrouter". Same temperature/seed/max_tokens handling as the
-    Ollama path; returns an ollama-shaped dict so callers can treat both alike."""
-    from openai import OpenAI
-    oa_messages = []
-    for m in messages:
-        if m.get("images"):
-            parts = [{"type": "text", "text": m["content"]}] + [
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}} for b in m["images"]]
-            oa_messages.append({"role": m["role"], "content": parts})
-        else:
-            oa_messages.append({"role": m["role"], "content": m["content"]})
-    kwargs = {k: v for k, v in (("temperature", config.get("temperature")),
-                                ("max_tokens", config.get("max_tokens")),
-                                ("seed", config.get("seed"))) if v is not None}
-    client = OpenAI(base_url=model.get("host", "https://openrouter.ai/api/v1"), api_key=model["api_key"])
-    resp = client.chat.completions.create(model=model["model"], messages=oa_messages, **kwargs)
-    choice = resp.choices[0]
-    usage = getattr(resp, "usage", None)
+def _field(value: Any, name: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _tool_call_plain(tool_call: Any) -> Dict[str, Any]:
+    function = _field(tool_call, "function") or {}
+    arguments = _field(function, "arguments") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
     return {
-        "message": {"content": choice.message.content or ""},
-        "prompt_eval_count": getattr(usage, "prompt_tokens", None),
-        "eval_count": getattr(usage, "completion_tokens", None),
-        "done": True, "done_reason": choice.finish_reason, "model": resp.model,
+        "id": _field(tool_call, "id"),
+        "type": _field(tool_call, "type") or "function",
+        "function": {
+            "name": _field(function, "name"),
+            "arguments": arguments,
+        },
     }
+
+
+def _chat_with_tools(client: Any, model_name: str, messages: List[Message], options: Dict[str, Any],
+                     config: Dict[str, Any], tools: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, List[Message], List[Any]]:
+    """Run one agent LLM turn, executing any declared GAIA tools until the
+    model returns ordinary assistant content. Tool results are returned as
+    messages so callers can preserve exactly what evidence the agent saw."""
+    tool_messages: List[Message] = []
+    raw_responses: List[Any] = []
+    working = [dict(m) for m in messages]
+    tools = tools or []
+    tool_round = 0
+    max_tool_rounds = int(config.get("max_tool_rounds", 8))
+    while True:
+        resp = client.chat(model=model_name, messages=working, tools=tools, options=options)
+        raw_responses.append(resp)
+        message = _field(resp, "message")
+        content = _field(message, "content") or ""
+        tool_calls = _field(message, "tool_calls") or []
+        if not tool_calls:
+            config["_last_tool_messages"] = tool_messages
+            return content, tool_messages, raw_responses
+
+        tool_round += 1
+        if tool_round > max_tool_rounds:
+            config["_last_tool_messages"] = tool_messages
+            return content or "Tool-call limit reached before the agent produced a final response.", tool_messages, raw_responses
+        plain_calls = [_tool_call_plain(tc) for tc in tool_calls]
+        assistant_tool_message: Message = {
+            "role": "assistant", "content": content, "tool_calls": plain_calls,
+        }
+        working.append(assistant_tool_message)
+        tool_messages.append(assistant_tool_message)
+
+        for tc in plain_calls:
+            name = tc["function"]["name"]
+            args = tc["function"]["arguments"]
+            function = gaia_utils.WEB_TOOL_FUNCTIONS.get(name)
+            if function is None:
+                result = f"Tool error: unknown tool {name!r}."
+            else:
+                try:
+                    result = function(**args, _config=config)
+                except Exception as exc:
+                    result = f"Tool error in {name}: {type(exc).__name__}: {exc}"
+            tool_message: Message = {
+                "role": "tool", "tool_name": name, "content": str(result),
+            }
+            working.append(tool_message)
+            tool_messages.append(tool_message)
 
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
@@ -137,15 +187,14 @@ def call_llm(messages: List[Message], config: Dict[str, Any], call_type: str = "
     # call_type is purely a label for instrumentation (see gaia_runner/debate_usage.py) --
     # it has no effect on model selection or the request itself.
     model = random.choice(config["model_list"])
-    if model.get("provider") == "openrouter":
-        return openrouter_chat(model, messages, config)["message"]["content"]
     headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
     client = ollama.Client(host=model.get("host", "http://localhost:11434"), headers=headers)
     options = {k: v for k, v in (("temperature", config.get("temperature")),
                                   ("num_predict", config.get("max_tokens")),
                                   ("seed", config.get("seed"))) if v is not None}
-    resp = client.chat(model=model["model"], messages=messages, options=options)
-    return resp["message"]["content"]
+    tools = gaia_utils.WEB_TOOL_DEFINITIONS if call_type == "agent_turn" else []
+    content, _, _ = _chat_with_tools(client, model["model"], messages, options, config, tools=tools)
+    return content
 
 
 def parse_gricean_scores(text: str) -> Dict[str, Dict[str, Any]]:
@@ -155,6 +204,28 @@ def parse_gricean_scores(text: str) -> Dict[str, Dict[str, Any]]:
         return {m: {"score": int(data[m]["score"]), "reason": str(data[m].get("reason", ""))} for m in GRICEAN_METRICS}
     except Exception:
         return {m: {"score": 3, "reason": "could not parse Gricean adherence checker output"} for m in GRICEAN_METRICS}
+
+
+def _tool_evidence_for_reply(ctx: List[Message], reply_content: str) -> List[str]:
+    """Return recorded web evidence cited by a reply, preserving older-round
+    sources when the final answer relies on them."""
+    cited = set(re.findall(r"\[(W\d+)\]", reply_content or ""))
+    if not cited:
+        return []
+    evidence: List[str] = []
+    for message in ctx:
+        if message.get("role") != "tool":
+            continue
+        content = str(message.get("content", ""))
+        if any(f"[{source_id}]" in content for source_id in cited):
+            evidence.append(content)
+    return evidence
+
+
+def _tool_evidence_for_last_reply(ctx: List[Message]) -> List[str]:
+    if not ctx or ctx[-1].get("role") != "assistant":
+        return []
+    return _tool_evidence_for_reply(ctx, str(ctx[-1].get("content", "")))
 
 
 def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, round_idx: int,
@@ -191,6 +262,9 @@ def construct_broadcast(others: List[Tuple[int, List[Message]]], question: str, 
         if info and info.get("notice"):
             delivered = wrap_with_trust_notice(content, info["notice"])
         parts.append(f"\nAgent {agent_id + 1}: ```{delivered}```")
+        evidence = _tool_evidence_for_last_reply(ctx)
+        if evidence:
+            parts.append(f"\nEvidence retrieved by Agent {agent_id + 1} for this reply:\n" + "\n\n".join(evidence))
         if info and info.get("reflect"):
             flagged.append((agent_id, content, info.get("reason", "")))
     parts.append(
@@ -250,16 +324,33 @@ class DebateState(TypedDict):
 
 
 def _build_initial_message(query: str, attachment: Optional[Dict[str, Any]]) -> Message:
-    msg: Message = {"role": "user", "content": f"{query}\nState your final answer clearly at the end."}
+    msg: Message = {
+        "role": "user",
+        "content": (
+            f"{query}\nState your final answer clearly at the end.\n\n"
+            "When you use information from a GAIA attachment, cite [GAIA-ATTACHMENT]. "
+            "When you use information returned by a web tool, cite the returned [W#] source. "
+            "Do not claim to have consulted a source that does not appear in your available tool/attachment evidence."
+        ),
+    }
     if not attachment:
         return msg
     if attachment.get("text"):
         note = f" {attachment['note']}" if attachment.get("note") else ""
-        msg["content"] += f"\n\nAttached file contents:{note}\n\n{attachment['text']}"
+        source_id = attachment.get("source_id", "GAIA-ATTACHMENT")
+        source_name = attachment.get("source_name", "attached file")
+        msg["content"] += (
+            f"\n\n[{source_id}] Source: {source_name}{note}\n"
+            f"Cite this source as [{source_id}].\n\n{attachment['text']}"
+        )
     if attachment.get("images_b64"):
         msg["images"] = attachment["images_b64"]
+        source_id = attachment.get("source_id", "GAIA-ATTACHMENT")
+        msg["content"] += f"\n\n[{source_id}] The attached image/PDF/video frames are the supplied GAIA source; cite [{source_id}]."
     if attachment.get("audio_b64"):
         msg["audio"] = attachment["audio_b64"]
+        source_id = attachment.get("source_id", "GAIA-ATTACHMENT")
+        msg["content"] += f"\n\n[{source_id}] The attached audio is the supplied GAIA source; cite [{source_id}]."
     if attachment.get("kind") == "unsupported" and attachment.get("note"):
         msg["content"] += f"\n\n[Note: an attached file could not be included -- {attachment['note']}]"
     return msg
@@ -323,7 +414,9 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         extra = [{"role": "user", "content": f"[Private reflection -- not part of the shared conversation]\n"
                                               f"{reflection}\n\nNow give your updated answer to the task."}]
 
+    state["config"].pop("_last_tool_messages", None)
     reply = call_llm(contexts[i] + extra, state["config"], call_type="agent_turn")
+    contexts[i].extend(state["config"].pop("_last_tool_messages", []) or [])
     contexts[i].append({"role": "assistant", "content": reply})
     next_i = (i + 1) % state["agents_num"]
     return {"contexts": contexts, "agent_idx": next_i, "round": r + 1 if next_i == 0 else r,
@@ -370,11 +463,14 @@ async def _trust_allocator_check(state: DebateState, speaker: int, ctx: List[Mes
     # The initial per-agent user message may already contain the attachment
     # payload. The allocator receives the attachment separately below, so do
     # not duplicate that payload inside its conversational transcript.
-    conversation_messages = [
-        {"source": m["role"], "content": m["content"]}
-        for idx, m in enumerate(ctx)
-        if not (idx == 0 and m.get("role") == "user")
-    ]
+    conversation_messages = []
+    for idx, m in enumerate(ctx):
+        if idx == 0 and m.get("role") == "user":
+            continue
+        source = m.get("role", "unknown")
+        if source == "tool":
+            source = f"tool:{m.get('tool_name', 'unknown')}"
+        conversation_messages.append({"source": source, "content": m.get("content", "")})
     conversation = format_conversation(conversation_messages)
     verdict = await allocate_trust(
         state["query"], conversation, f"Agent {speaker + 1}",
@@ -429,8 +525,13 @@ def gricean_check(state: DebateState) -> Dict[str, Any]:
 
 
 def aggregate(state: DebateState) -> Dict[str, Any]:
-    answers = "\n\n".join(f"Solution {i + 1}:\n{c[-1]['content']}" for i, c in enumerate(state["contexts"]))
-    prompt = f"Task:\n{state['query']}\n\n{answers}\n\nReason over these solutions and give one final answer."
+    blocks = []
+    for i, ctx in enumerate(state["contexts"]):
+        evidence = _tool_evidence_for_last_reply(ctx)
+        evidence_text = ("\nEvidence used by this solution:\n" + "\n\n".join(evidence)) if evidence else ""
+        blocks.append(f"Solution {i + 1}:\n{ctx[-1]['content']}{evidence_text}")
+    answers = "\n\n".join(blocks)
+    prompt = f"Task:\n{state['query']}\n\n{answers}\n\nReason over these solutions and their recorded evidence, and give one final answer."
     instruction = state["config"].get("answer_format_instruction")
     if instruction:
         prompt += f"\n\n{instruction}"
