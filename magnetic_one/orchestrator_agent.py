@@ -43,6 +43,11 @@ from magnetic_one.state import MagenticState
 MAX_REPLANS_PER_TURN = 5
 
 
+def _trace_input_messages(messages) -> List[Dict[str, str]]:
+    """Shallow-copy the explicit prompt context that directly produced a message."""
+    return [{"source": getattr(m, "source", None), "content": str(getattr(m, "content", ""))} for m in messages]
+
+
 def build_orchestrator_node(
     model_client: ChatCompletionClient,
     participant_names: List[str],
@@ -79,7 +84,15 @@ def build_orchestrator_node(
             "task_ledger": {"facts": facts, "plan": response.content},
             "n_stalls": 0,
         }
-        return {**state, "messages": [_ledger_message(state)]}
+        ledger_message = _ledger_message(state)
+        direct_inputs = [{"source": "task", "content": state["task"]},
+                         {"source": "team", "content": state["team_description"]},
+                         {"source": ORCHESTRATOR_NAME, "content": state["task_ledger"]["facts"]},
+                         {"source": ORCHESTRATOR_NAME, "content": state["task_ledger"]["plan"]}]
+        return {
+            **state, "messages": [ledger_message], "message_inputs": [direct_inputs],
+            "message_tool_events": [[]]
+        }
 
     async def _replan(state: MagenticState) -> MagenticState:
         # Matches the pre-existing pending_reflection precedent: only
@@ -105,7 +118,16 @@ def build_orchestrator_node(
                                               extra_create_args={"call_type": "orchestrator_task_ledger_plan_update"})
 
         state = {**state, "task_ledger": {"facts": facts, "plan": response.content}}
-        return {**state, "messages": [_ledger_message(state)]}
+        ledger_message = _ledger_message(state)
+        direct_inputs = [{"source": "task", "content": state["task"]},
+                         {"source": "team", "content": state["team_description"]},
+                         {"source": ORCHESTRATOR_NAME, "content": state["task_ledger"]["facts"]},
+                         {"source": ORCHESTRATOR_NAME, "content": state["task_ledger"]["plan"]}]
+        return {
+            **state, "messages": list(state["messages"]) + [ledger_message],
+            "message_inputs": list(state.get("message_inputs", [])) + [direct_inputs],
+            "message_tool_events": list(state.get("message_tool_events", [])) + [[]]
+        }
 
     async def _progress_ledger_pass(state: MagenticState) -> MagenticState:
         context = build_llm_context(state["messages"], wrap_last_with_level=state.get("pending_trust_level"))
@@ -143,8 +165,12 @@ def build_orchestrator_node(
             n_stalls = max(0, n_stalls - 1)
 
         new_messages = list(state["messages"])
+        new_inputs = list(state.get("message_inputs", []))
+        new_tool_events = list(state.get("message_tool_events", []))
         if not ledger["is_request_satisfied"]["answer"]:
             new_messages.append({"source": ORCHESTRATOR_NAME, "content": ledger["instruction_or_question"]["answer"]})
+            new_inputs.append(_trace_input_messages(context))
+            new_tool_events.append([])
 
         return {
             **state,
@@ -155,6 +181,8 @@ def build_orchestrator_node(
             "next_speaker": ledger["next_speaker"]["answer"],
             "instruction": ledger["instruction_or_question"]["answer"],
             "messages": new_messages,
+            "message_inputs": new_inputs,
+            "message_tool_events": new_tool_events,
         }
 
     async def _final_answer(state: MagenticState) -> MagenticState:
@@ -171,6 +199,8 @@ def build_orchestrator_node(
             "final_answer": response.content,
             "termination_reason": reason,
             "messages": list(state["messages"]) + [{"source": ORCHESTRATOR_NAME, "content": response.content}],
+            "message_inputs": list(state.get("message_inputs", [])) + [_trace_input_messages(context)],
+            "message_tool_events": list(state.get("message_tool_events", [])) + [[]],
         }
 
     def _past_limits(state: MagenticState) -> bool:

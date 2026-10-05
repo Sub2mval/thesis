@@ -92,7 +92,8 @@ logger = logging.getLogger("magentic_one_langgraph.gricean_checker")
 # which only needs recent context to judge local consistency, unlike the
 # Orchestrator's own loop-detection, which needs the full history. The
 # canonical Trust_Allocator branch (_run_trust_allocator_design) does NOT
-# use this -- it is given the full message history, unwindowed.
+# use this -- it gets the judged agent's direct inputs, its recorded tool
+# results, and its own message without recursively expanding earlier inputs.
 ADHERENCE_CHECK_CONTEXT_WINDOW = 6
 
 _TRUST_REFLECTION_PROMPT = """You are about to receive the following message from "%%SOURCE%%":
@@ -143,15 +144,43 @@ async def _run_trust_allocator_design(
     reached for them; Design 4's policy is reflect=True for medium/low
     verdicts, which is what actually exercises that call.
 
-    Unlike the legacy 4-axis checker below (which only needs recent
-    context to judge local consistency, hence ADHERENCE_CHECK_CONTEXT_
-    WINDOW), the canonical Trust_Allocator gets the FULL message history
-    -- no windowing -- so its verdict can be grounded in everything said
-    so far, not just the last few turns.
+    The canonical Trust_Allocator judges the LAST message using that
+    message's explicit inputs, the tool results produced by the same agent
+    while working on the task, and the message itself. Earlier messages may
+    therefore appear as content inside those direct inputs, but their own
+    inputs/tool histories are never recursively copied.
     """
-    conversation = legacy_trust_allocator.format_conversation(
-        [{"source": m["source"], "content": m["content"]} for m in messages]
-    )
+    message_inputs = state.get("message_inputs", [])
+    message_tool_events = state.get("message_tool_events", [])
+    direct_inputs = message_inputs[-1] if message_inputs else []
+
+    # The checker needs every tool result the *evaluated agent* actually
+    # observed, not just results from its final turn. Because each permanent
+    # message has an aligned tool-event slot, we can collect them by source
+    # without copying any prior message's inputs recursively.
+    target_source = last["source"]
+    tool_events = []
+    for indexed_message, indexed_events in zip(messages, message_tool_events):
+        if indexed_message.get("source") == target_source:
+            tool_events.extend(indexed_events or [])
+
+    conversation_items = [
+        {"source": item.get("source", "input"), "content": item.get("content", "")}
+        for item in direct_inputs
+    ]
+    for event in tool_events:
+        for result in event.get("results", []) or []:
+            conversation_items.append({
+                "source": f"tool:{result.get('name', event.get('type', 'tool'))}",
+                "content": result.get("content", ""),
+            })
+        if event.get("output") is not None:
+            conversation_items.append({
+                "source": f"tool:{event.get('type', 'tool')}",
+                "content": event.get("output", ""),
+            })
+    conversation_items.append({"source": last["source"], "content": last["content"]})
+    conversation = legacy_trust_allocator.format_conversation(conversation_items)
 
     async def _client(prompt: str) -> str:
         # Keep the attachment separate from MessageHistory. Text-based

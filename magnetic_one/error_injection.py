@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, TypedDict
 
+from autogen_agentchat.messages import TextMessage
+from autogen_core import CancellationToken
 from autogen_core.models import ChatCompletionClient, UserMessage
 
 from magnetic_one.context_utils import ORCHESTRATOR_NAME
@@ -125,6 +127,9 @@ async def generate_corrupted_message(
     fm_id: Optional[str] = None,
     target_role: Optional[str] = None,
     comparison_messages: Optional[List[ThreadMessage]] = None,
+    corruption_agent_factory=None,
+    target_inputs: Optional[List[ThreadMessage]] = None,
+    target_tool_events: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Generate one role-aware corruption or return an INELIGIBLE result."""
     mode = choose_failure_mode(error_type, fm_id)
@@ -147,6 +152,11 @@ async def generate_corrupted_message(
             "The corruption will be injected into BOTH Trace A and Trace B. "
             "It must therefore be semantically valid for both target messages."
         )
+    input_text = "\n".join(f"[{m.get('source', 'input')}]: {m.get('content', '')}" for m in (target_inputs or [])) or "(no separately recorded direct inputs)"
+    tool_text = "\n".join(
+        f"[{ev.get('type', 'tool')}]: " + " | ".join(str(r.get('content', '')) for r in (ev.get('results') or []))
+        for ev in (target_tool_events or [])
+    ) or "(no recorded tool results)"
     prompt = _CORRUPTION_PROMPT.format(
         fm_instruction=mode["instruction"],
         task=task,
@@ -154,16 +164,41 @@ async def generate_corrupted_message(
         conversation=conversation,
         original_content=target["content"],
         paired_section=paired_section,
+    ) + (
+        "\n\nDIRECT INPUTS AVAILABLE TO THE TARGET AGENT:\n" + input_text
+        + "\n\nTOOL RESULTS AVAILABLE TO THE TARGET AGENT:\n" + tool_text
+        + "\n\nThe corruption must remain plausible for the target role and capabilities. "
+          "Do not claim tool use the target did not perform."
     )
-    # call_type="corruption" (PART 8) -- instrumentation-only label; see
-    # ollama_client.py's module docstring for how it's stripped before
-    # the real API call.
-    response = await model_client.create(
-        [UserMessage(content=prompt, source="ErrorInjector")],
-        extra_create_args={"call_type": "corruption"},
-    )
-    assert isinstance(response.content, str)
-    raw = response.content.strip()
+
+    response = None
+    if corruption_agent_factory is not None:
+        corruption_agent = corruption_agent_factory()
+        try:
+            response = None
+            async for event in corruption_agent.on_messages_stream(
+                [TextMessage(content=prompt, source="ErrorInjector")], CancellationToken()
+            ):
+                if hasattr(event, "chat_message"):
+                    response = event.chat_message
+            if response is None:
+                raise RuntimeError("Corruption agent produced no final chat message.")
+            raw = response.to_model_text()
+        finally:
+            close_fn = getattr(corruption_agent, "close", None)
+            if close_fn is not None:
+                try:
+                    await close_fn()
+                except Exception:
+                    pass
+    else:
+        response = await model_client.create(
+            [UserMessage(content=prompt, source="ErrorInjector")],
+            extra_create_args={"call_type": "corruption"},
+        )
+        assert isinstance(response.content, str)
+        raw = response.content
+    raw = raw.strip()
     lines = raw.splitlines()
     marker = lines[0].strip().upper() if lines else ""
     if marker == "INELIGIBLE":
@@ -185,7 +220,7 @@ async def generate_corrupted_message(
         "fm_id": mode["id"],
         "fm_name": mode["name"],
         "prompt": prompt,
-        "injector_response": response.content.strip(),
+        "injector_response": raw,
     }
 
 

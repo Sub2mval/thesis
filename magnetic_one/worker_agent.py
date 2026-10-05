@@ -31,9 +31,16 @@ def build_worker_nodes(agent_callers: Dict[str, AgentCaller]) -> Dict[str, Any]:
             # No-op when pending_trust_level is None/"undefined" (design 4,
             # or a design-1-3 turn whose policy called for no notice).
             instruction = wrap_with_trust_notice(instruction, state.get("pending_trust_level"))
-            content = truncate_message_content(await caller(instruction, CancellationToken()))
+            explicit_inputs = [{"source": ORCHESTRATOR_NAME, "content": instruction}]
+            content, tool_events = await caller(instruction, CancellationToken())
+            content = truncate_message_content(content)
             new_messages = list(state["messages"]) + [{"source": name, "content": content}]
-            return {**state, "messages": new_messages, "next_after_check": ORCHESTRATOR_NAME}
+            message_inputs = [list(x) for x in state.get("message_inputs", [])] + [explicit_inputs]
+            message_tool_events = [list(x) for x in state.get("message_tool_events", [])] + [tool_events]
+            return {
+                **state, "messages": new_messages, "message_inputs": message_inputs,
+                "message_tool_events": message_tool_events, "next_after_check": ORCHESTRATOR_NAME
+            }
 
         return worker_node
 

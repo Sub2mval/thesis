@@ -7,7 +7,7 @@ from __future__ import annotations
 import warnings
 from typing import Awaitable, Callable, Dict, Optional, Union
 
-from autogen_agentchat.agents import ApprovalFuncType, CodeExecutorAgent, UserProxyAgent
+from autogen_agentchat.agents import ApprovalFuncType, AssistantAgent, CodeExecutorAgent, UserProxyAgent
 from autogen_core import CancellationToken
 from autogen_core.code_executor import CodeExecutor
 from autogen_core.models import ChatCompletionClient
@@ -22,7 +22,6 @@ from autogen_ext.code_executors import create_default_code_executor
 from magnetic_one.context_utils import make_autogen_agent_caller
 from magnetic_one.ollama_client import build_ollama_client, get_usage_tracking, reset_usage_tracking
 from magnetic_one.ollama_cloud_client import DEFAULT_OLLAMA_CLOUD_HOST, RotatingKeyOllamaClient
-from magnetic_one.openrouter_client import DEFAULT_OPENROUTER_HOST, build_rotating_openrouter_client
 from magnetic_one.orchestrator_graph import build_magentic_one_graph
 from magnetic_one.prompts import ORCHESTRATOR_FINAL_ANSWER_PROMPT
 
@@ -64,6 +63,27 @@ class MagenticOneLangGraph:
         executor = CodeExecutorAgent("ComputerTerminal", code_executor=code_executor, approval_func=approval_func)
 
         self._agents = {fs.name: fs, ws.name: ws, coder.name: coder, executor.name: executor}
+        # Fresh specialized agents for error injection. Each factory mirrors
+        # the target role/tool surface, so the corruption is produced under
+        # the same capabilities rather than by a generic external model.
+        self._corruption_agent_factories = {
+            "FileSurfer": lambda: FileSurfer("CorruptionAgent", model_client=client),
+            "WebSurfer": lambda: MultimodalWebSurfer("CorruptionAgent", model_client=client),
+            "Coder": lambda: MagenticOneCoderAgent("CorruptionAgent", model_client=client),
+            "ComputerTerminal": lambda: CodeExecutorAgent(
+                "CorruptionAgent", code_executor=code_executor, model_client=client,
+                approval_func=approval_func, description=executor.description,
+            ),
+            "MagenticOneOrchestrator": lambda: AssistantAgent(
+                "CorruptionAgent", model_client=client,
+                system_message=(
+                    "Act as the Magentic-One Orchestrator. Decompose the task, track the current "
+                    "task/progress state, decide what the team needs next, and communicate concise "
+                    "instructions or questions to workers. Your output must look like a normal "
+                    "orchestrator message, including its usual format and role boundaries."
+                ),
+            ),
+        }
         if hil_mode:
             user_proxy = UserProxyAgent("User", input_func=input_func)
             self._agents[user_proxy.name] = user_proxy
@@ -127,24 +147,9 @@ class MagenticOneLangGraph:
         )
         return cls(client=client, gricean_model_client=gricean_client, **kwargs)
 
-    @classmethod
-    def from_openrouter(
-        cls,
-        model: str,
-        api_keys: list,
-        host: str = DEFAULT_OPENROUTER_HOST,
-        gricean_model: Optional[str] = None,
-        model_info: Optional[dict] = None,
-        **kwargs,
-    ) -> "MagenticOneLangGraph":
-        """Same as from_ollama_cloud(), but via OpenRouter (OR_Key_N keys)."""
-        client = build_rotating_openrouter_client(model, api_keys, host, model_info)
-        gricean_client = build_rotating_openrouter_client(gricean_model, api_keys, host) if gricean_model else None
-        return cls(client=client, gricean_model_client=gricean_client, **kwargs)
-
     def _validate_client_capabilities(self, client: ChatCompletionClient) -> None:
         capabilities = client.model_info
-        required_capabilities = ["function_calling", "json_output"]
+        required_capabilities = ["vision", "function_calling", "json_output"]
         if not all(capabilities.get(cap) for cap in required_capabilities):
             warnings.warn(
                 "Client capabilities for MagenticOne must include vision, function calling, and json output.",
@@ -172,6 +177,8 @@ class MagenticOneLangGraph:
             "task": task,
             "attachment": attachment,
             "messages": [],
+            "message_inputs": [],
+            "message_tool_events": [],
             "task_ledger": {},
             "n_rounds": 0,
             "n_stalls": 0,

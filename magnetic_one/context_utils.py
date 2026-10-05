@@ -21,7 +21,7 @@ requirement.
 from __future__ import annotations
 
 import re
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from autogen_agentchat.base import ChatAgent
 from autogen_agentchat.messages import TextMessage
@@ -33,7 +33,8 @@ from trust_allocator.legacy_trust_allocator import wrap_with_trust_notice
 
 ORCHESTRATOR_NAME = "MagenticOneOrchestrator"
 
-AgentCaller = Callable[[str, CancellationToken], Awaitable[str]]
+AgentCallResult = tuple[str, List[Dict[str, Any]]]
+AgentCaller = Callable[[str, CancellationToken], Awaitable[AgentCallResult]]
 
 
 def get_compatible_context(model_client: ChatCompletionClient, messages: List[LLMMessage]) -> List[LLMMessage]:
@@ -79,9 +80,33 @@ def make_autogen_agent_caller(agent: ChatAgent) -> AgentCaller:
     """Adapt an AutoGen ChatAgent into the plain async-function shape the
     graph's `call_agent` node dispatches through."""
 
-    async def _call(instruction: str, cancellation_token: CancellationToken) -> str:
+    async def _call(instruction: str, cancellation_token: CancellationToken) -> AgentCallResult:
         message = TextMessage(content=instruction, source=ORCHESTRATOR_NAME)
-        response = await agent.on_messages([message], cancellation_token)
-        return response.chat_message.to_model_text()
+        tool_events: List[Dict[str, Any]] = []
+        final_response = None
+        async for event in agent.on_messages_stream([message], cancellation_token):
+            if hasattr(event, "chat_message"):
+                final_response = event.chat_message
+            event_type = type(event).__name__
+            if event_type in {"ToolCallExecutionEvent", "CodeExecutionEvent"}:
+                if event_type == "ToolCallExecutionEvent":
+                    results = []
+                    for result in getattr(event, "content", []) or []:
+                        results.append({
+                            "name": getattr(result, "name", None),
+                            "call_id": getattr(result, "call_id", None),
+                            "content": getattr(result, "content", str(result)),
+                            "is_error": getattr(result, "is_error", None),
+                        })
+                    tool_events.append({"type": event_type, "source": getattr(event, "source", None), "results": results})
+                else:
+                    result = getattr(event, "result", None)
+                    tool_events.append({
+                        "type": event_type, "source": getattr(event, "source", None),
+                        "output": getattr(result, "output", event.to_text() if hasattr(event, "to_text") else str(event)),
+                    })
+        if final_response is None:
+            raise RuntimeError(f"Agent {agent.name} produced no final chat message.")
+        return final_response.to_model_text(), tool_events
 
     return _call

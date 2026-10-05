@@ -36,7 +36,6 @@ from autogen_core import CancellationToken
 from autogen_core.models import ChatCompletionClient, CreateResult, LLMMessage
 
 from magnetic_one.ollama_client import InstrumentedOllamaChatCompletionClient, get_usage_tracking as _get_local_usage
-from magnetic_one.model_info import lookup_model_info
 from autogen_core.tools import Tool, ToolSchema
 from pydantic import BaseModel
 
@@ -57,7 +56,7 @@ _TRANSIENT_RETRY_KEYWORDS = ("rate limit", "quota", "too many requests", "limit 
 _AUTH_ERROR_STATUS_CODES = {401, 403}
 
 _FALLBACK_MODEL_INFO = {
-    "vision": False,
+    "vision": True,
     "function_calling": True,
     "json_output": True,
     "family": "unknown",
@@ -112,12 +111,11 @@ def load_api_keys_from_env(prefix: str = "OLLAMA_API_KEY", env_file: Optional[st
 
 
 def _classify_error(e: Exception) -> Optional[str]:
-    # Both ollama's ResponseError and openai's APIStatusError expose status_code.
-    status = getattr(e, "status_code", None)
-    if status in _TRANSIENT_RETRY_STATUS_CODES:
-        return "transient"
-    if status in _AUTH_ERROR_STATUS_CODES:
-        return "auth"
+    if isinstance(e, ResponseError):
+        if e.status_code in _TRANSIENT_RETRY_STATUS_CODES:
+            return "transient"
+        if e.status_code in _AUTH_ERROR_STATUS_CODES:
+            return "auth"
     msg = str(e).lower()
     if any(kw in msg for kw in _TRANSIENT_RETRY_KEYWORDS):
         return "transient"
@@ -152,8 +150,6 @@ def _build_client_for_key(
     key_index: int = 0,
 ) -> ChatCompletionClient:
     key_identifier = _mask_key(key, key_index)
-    if model_info is None:
-        model_info = lookup_model_info(model)
     with _temporarily_set_env("OLLAMA_API_KEY", key):
         try:
             if model_info is not None:
@@ -200,14 +196,12 @@ class RotatingKeyOllamaClient:
         base_backoff_seconds: float = 5.0,
         max_backoff_seconds: float = 120.0,
         max_consecutive_full_cycles: Optional[int] = 20,
-        client_factory: Optional[Any] = None,  # (key, key_index) -> client; replaces the Ollama builder (used for OpenRouter)
     ):
         if not api_keys:
             raise ValueError("api_keys must be non-empty.")
         self._keys = list(api_keys)
         merged_options = _merge_options(temperature, seed, options)
         self._clients: List[ChatCompletionClient] = [
-            client_factory(key, idx) if client_factory else
             _build_client_for_key(model=model, host=host, key=key, model_info=model_info, options=merged_options, key_index=idx)
             for idx, key in enumerate(self._keys)
         ]

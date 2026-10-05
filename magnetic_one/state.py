@@ -94,6 +94,13 @@ class MagenticState(TypedDict, total=False):
 
     task_ledger: TaskLedger
     messages: List[ThreadMessage]  # MessageHistory
+    # Exact explicit inputs used to produce each permanent message. These are
+    # shallow snapshots: prior messages may appear as content, but their own
+    # inputs/tool histories are never recursively embedded.
+    message_inputs: List[List[ThreadMessage]]
+    # Tool results observed while producing each permanent message. The
+    # Trust Allocator can inspect these without receiving direct tool access.
+    message_tool_events: List[List[Dict[str, Any]]]
 
     n_rounds: int
     n_stalls: int

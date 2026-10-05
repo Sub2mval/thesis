@@ -191,6 +191,7 @@ async def fork_paired_traces_with_error(
     fm_id: Optional[str] = None,
     strategy: str = "middle_agent_message",
     target_message_index: Optional[int] = None,
+    corruption_agent_factories: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Fork the SAME already-completed baseline and Gricean-checked runs
     (same `graph` -- one compiled graph serves both, distinguished only by
@@ -212,10 +213,21 @@ async def fork_paired_traces_with_error(
         if idx >= shared_len:
             raise ValueError(f"message index {idx} is not in the shared prefix (only the first {shared_len} messages are guaranteed identical).")
 
-    # Generate the corruption ONCE, off the shared (hence identical-either-
-    # way) prefix, so both forks get the exact same corrupted text rather
-    # than two independently-sampled corruptions.
-    corruption = await generate_corrupted_message(model_client, task, baseline_messages, idx, error_type, fm_id)
+    # Generate the corruption ONCE, off the shared prefix, so both forks get
+    # the exact same corrupted text. The injector is created with the same
+    # role/tool surface as the target agent and sees the target's direct
+    # inputs/tool results, but not recursively-expanded predecessor inputs.
+    baseline_snapshot = baseline_checkpoints[-1]["snapshot"]
+    baseline_inputs = baseline_snapshot.values.get("message_inputs", []) or []
+    baseline_tools = baseline_snapshot.values.get("message_tool_events", []) or []
+    target_source = baseline_messages[idx]["source"]
+    corruption = await generate_corrupted_message(
+        model_client, task, baseline_messages, idx, error_type, fm_id,
+        target_role=target_source,
+        corruption_agent_factory=(corruption_agent_factories or {}).get(target_source),
+        target_inputs=baseline_inputs[idx] if idx < len(baseline_inputs) else None,
+        target_tool_events=baseline_tools[idx] if idx < len(baseline_tools) else None,
+    )
 
     baseline_fork = await _apply_fork(graph, baseline_checkpoints, idx, corruption["content"])
     gricean_fork = await _apply_fork(graph, gricean_checkpoints, idx, corruption["content"])
