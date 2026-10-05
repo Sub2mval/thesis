@@ -9,6 +9,7 @@ sent, without having to reverse-engineer the machine log.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -38,14 +39,31 @@ def _call_output(call: Dict[str, Any]) -> Any:
     return None
 
 
-def _format_messages(messages: Iterable[Dict[str, Any]]) -> str:
+def _collect_web_sources(trace: Dict[str, Any]) -> Dict[str, str]:
+    sources: Dict[str, str] = {}
+    for call in ((trace.get("token_stats") or {}).get("calls") or []):
+        for event in call.get("tool_events") or []:
+            content = str(event.get("content", ""))
+            for sid, url in re.findall(r"\[(W\d+)\].*?\bURL:\s*(https?://\S+)", content, flags=re.S):
+                sources[sid] = url.rstrip(")>")
+    return sources
+
+
+def _linkify_citations(text: str, sources: Dict[str, str]) -> str:
+    def repl(match):
+        sid = match.group(1)
+        url = sources.get(sid)
+        return f"[{sid}]({url})" if url else match.group(0)
+    return re.sub(r"\[(W\d+)\](?!\()", repl, text)
+
+
+def _format_messages(messages: Iterable[Dict[str, Any]], sources: Optional[Dict[str, str]] = None) -> str:
     blocks: List[str] = []
     for i, msg in enumerate(messages, 1):
         role = msg.get("role", "message")
-        content = msg.get("content", "")
+        content = _linkify_citations(str(msg.get("content", "")), sources or {})
         blocks.append(f"**Message {i}: {role}**\n\n{_md(content)}")
     return "\n\n".join(blocks)
-
 
 def _title_for_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[str] = None) -> str:
     call_type = call.get("call_type", "llm_call")
@@ -64,7 +82,7 @@ def _title_for_call(call: Dict[str, Any], agent_index: int, agent_source: Option
     return f"LLM call — {call_type}"
 
 
-def _render_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[str] = None) -> str:
+def _render_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[str] = None, sources: Optional[Dict[str, str]] = None) -> str:
     title = _title_for_call(call, agent_index, agent_source)
     call_index = call.get("call_index")
     call_type = call.get("call_type")
@@ -76,22 +94,21 @@ def _render_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[
     lines.append("")
     lines.append("### Input")
     lines.append("")
-    lines.append(_format_messages(_call_messages(call)) or "(no recorded messages)")
+    lines.append(_format_messages(_call_messages(call), sources) or "(no recorded messages)")
     lines.append("")
     lines.append("### Output")
     lines.append("")
     output = _call_output(call)
-    lines.append(_md(output) or "(no generated text recorded)")
+    lines.append(_md(_linkify_citations(str(output or ""), sources)) or "(no generated text recorded)")
     tool_events = call.get("tool_events") or []
     if tool_events:
-        lines.extend(["", "### Tool evidence", ""])
-        for event in tool_events:
-            tool = event.get("tool") or "tool"
-            content = event.get("content", "")
-            lines.append(f"**{tool}**")
-            lines.append("")
-            lines.append(_md(content))
-            lines.append("")
+        tool_names = [str(event.get("tool") or event.get("tool_name") or event.get("type") or "tool") for event in tool_events]
+        unique_tools = ", ".join(dict.fromkeys(tool_names))
+        citations = [f"[{sid}]({url})" for sid, url in sorted((sources or {}).items())]
+        line = f"*Tool use: {unique_tools}"
+        if citations:
+            line += " · Sources: " + ", ".join(citations)
+        lines.append(line + "*")
     return "\n".join(lines).rstrip()
 
 
@@ -163,6 +180,7 @@ def format_readable(trace_or_readable: Dict[str, Any]) -> str:
         lines.extend([injection, "", "---", ""])
 
     calls = list((trace.get("token_stats") or {}).get("calls") or [])
+    sources = _collect_web_sources(trace)
     agent_index = 0
     agent_sources = [m.get("source") for m in (trace.get("messages") or [])]
     for call in calls:
@@ -170,11 +188,25 @@ def format_readable(trace_or_readable: Dict[str, Any]) -> str:
         if call.get("call_type") == "agent_turn":
             agent_source = agent_sources[agent_index] if agent_index < len(agent_sources) else None
             agent_index += 1
-        lines.append(_render_call(call, agent_index, agent_source))
+        lines.append(_render_call(call, agent_index, agent_source, sources))
         lines.extend(["", "---", ""])
 
     if not calls:
         lines.extend(["## Recorded messages", "", "No raw call records were stored for this trace.", ""])
+
+    magnetic_events = trace.get("message_tool_events") or []
+    if magnetic_events:
+        compact = []
+        for idx, events in enumerate(magnetic_events, 1):
+            names = []
+            for event in events:
+                names.extend(str(r.get("name")) for r in event.get("results", []) if r.get("name"))
+                if event.get("type") == "CodeExecutionEvent":
+                    names.append("code_execution")
+            if names:
+                compact.append(f"message {idx}: {', '.join(dict.fromkeys(names))}")
+        if compact:
+            lines.extend(["## Tool use", "", "  ".join(compact), ""])
 
     lines.extend([
         "## Final Result",

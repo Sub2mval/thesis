@@ -37,15 +37,10 @@ GAIA_FINAL_ANSWER_PROMPT = ORCHESTRATOR_FINAL_ANSWER_PROMPT + "\n" + gaia_utils.
 
 def build_magnetic_system(
     model: str, gricean_model: Optional[str], host: str,
-    api_keys: Optional[List[str]] = None, openrouter: bool = False, **kwargs: Any,
+    api_keys: Optional[List[str]] = None, **kwargs: Any,
 ) -> MagenticOneLangGraph:
     """Pass `api_keys` (e.g. loaded from OLLAMA_API_KEY_1..N) to route through
     Ollama Cloud with key rotation instead of a single local/cloud client."""
-    if api_keys and openrouter:
-        return MagenticOneLangGraph.from_openrouter(
-            model=model, api_keys=api_keys, host=host, gricean_model=gricean_model,
-            final_answer_prompt=GAIA_FINAL_ANSWER_PROMPT, **kwargs,
-        )
     if api_keys:
         return MagenticOneLangGraph.from_ollama_cloud(
             model=model, api_keys=api_keys, host=host, gricean_model=gricean_model,
@@ -173,6 +168,8 @@ def _build_trace(
         "experiment_design": experiment_design,
         "final_answer_raw": answer, "final_answer_extracted": extracted, "correct": correct,
         "messages": final_state.get("messages"),
+        "message_inputs": final_state.get("message_inputs", []),
+        "message_tool_events": final_state.get("message_tool_events", []),
         "trust_history": trust_history, "trust_scores": trust_history[-1]["scores"] if trust_history else None,
         "reflection_history": final_state.get("reflection_history"),
         "n_rounds": final_state.get("n_rounds"), "n_stalls": final_state.get("n_stalls"),
@@ -280,6 +277,7 @@ def run_magnetic_error_forks(
         fork = asyncio.run(fork_paired_traces_with_error(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
             error_type, ORCHESTRATOR_NAME, fm_id=fm_id, strategy=strategy,
+            corruption_agent_factories=magentic._corruption_agent_factories,
         ))
         stats = _combined_usage(magentic)
         for label, side in (("checker_off", "baseline"), ("checker_on", "gricean_checked")):
@@ -355,6 +353,7 @@ def run_magnetic_error_forks_by_source(
         fork = asyncio.run(fork_paired_traces_with_error(
             magentic.graph, magentic.client, pair["baseline_config"], pair["gricean_config"], task,
             error_type, ORCHESTRATOR_NAME, fm_id=fm_id, target_message_index=idx,
+            corruption_agent_factories=magentic._corruption_agent_factories,
         ))
         stats = _combined_usage(magentic)
         rows = []

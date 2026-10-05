@@ -86,10 +86,10 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
 
         request_record = {
             "messages": to_jsonsafe(messages),
-            "tools": to_jsonsafe(langgraph_debate.gaia_utils.WEB_TOOL_DEFINITIONS) if call_type == "agent_turn" else [],
-            "tool_choice": "auto" if call_type == "agent_turn" else None,
+            "tools": to_jsonsafe(langgraph_debate.gaia_utils.WEB_TOOL_DEFINITIONS) if call_type in {"agent_turn", "corruption"} else [],
+            "tool_choice": "auto" if call_type in {"agent_turn", "corruption"} else None,
             "json_output": None,
-            "generation_options": to_jsonsafe(options),
+            "generation_options": {**to_jsonsafe(options), "think": True},
             "temperature": config.get("temperature"),
             "seed": config.get("seed"),
             "other_request_parameters": {"max_tokens": config.get("max_tokens")},
@@ -129,7 +129,7 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
 
         try:
             recorder = _RecordingClient(client)
-            tools = langgraph_debate.gaia_utils.WEB_TOOL_DEFINITIONS if call_type == "agent_turn" else []
+            tools = langgraph_debate.gaia_utils.WEB_TOOL_DEFINITIONS if call_type in {"agent_turn", "corruption"} else []
             content, _, raw_responses = langgraph_debate._chat_with_tools(
                 recorder, model["model"], messages, options, config, tools=tools
             )
