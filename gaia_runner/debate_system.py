@@ -64,6 +64,26 @@ def _flatten_messages(contexts: List[List[Dict[str, Any]]], agents_num: int, rou
     return messages
 
 
+def _tool_events(contexts: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Extract tool-result messages from agent contexts into a compact
+    chronological trace field while leaving the full contexts authoritative."""
+    events: List[Dict[str, Any]] = []
+    for agent_id, ctx in enumerate(contexts):
+        reply_round = -1
+        for message in ctx:
+            if message.get("role") == "tool":
+                events.append({
+                    "agent_id": agent_id,
+                    "agent": f"Agent{agent_id + 1}",
+                    "tool": message.get("tool_name"),
+                    "round": reply_round,
+                    "content": message.get("content", ""),
+                })
+            elif message.get("role") == "assistant":
+                reply_round += 1
+    return events
+
+
 def _trust_history(gricean_history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """gricean_check() in langgraph_debate.py appends one entry per (round,
     agent) check, in the same order _flatten_messages walks replies in --
@@ -147,6 +167,7 @@ def _build_trace(
         "experiment_design": experiment_design,
         "final_answer_raw": answer, "final_answer_extracted": extracted, "correct": correct,
         "messages": messages,
+        "tool_events": _tool_events(contexts),
         "trust_history": trust_history, "trust_scores": trust_history[-1]["scores"] if trust_history else None,
         "reflection_history": _flatten_reflections(final_state.get("reflections")),
         "n_rounds": final_state.get("round", rounds_num), "n_stalls": None,

@@ -82,7 +82,17 @@ def _render_call(call: Dict[str, Any], agent_index: int, agent_source: Optional[
     lines.append("")
     output = _call_output(call)
     lines.append(_md(output) or "(no generated text recorded)")
-    return "\n".join(lines)
+    tool_events = call.get("tool_events") or []
+    if tool_events:
+        lines.extend(["", "### Tool evidence", ""])
+        for event in tool_events:
+            tool = event.get("tool") or "tool"
+            content = event.get("content", "")
+            lines.append(f"**{tool}**")
+            lines.append("")
+            lines.append(_md(content))
+            lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _render_injection(trace: Dict[str, Any]) -> Optional[str]:

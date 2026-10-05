@@ -1,13 +1,9 @@
 """
-llm_debate's call_llm() (langgraph_debate.py) discards the raw Ollama
-response and returns only the text, so today no token counts exist
-anywhere in that MAS -- unlike magnetic_one, which already tracks usage
-via InstrumentedOllamaChatCompletionClient (see ../magnetic_one/ollama_client.py).
-This module adds the same capability to llm_debate without editing its
-files: it installs a drop-in replacement for call_llm that behaves
-identically (same retry/model-selection logic) but also appends a
-COMPLETE per-attempt call record -- not just a token count -- to a list
-the caller controls.
+llm_debate's call_llm() (langgraph_debate.py) returns final text after
+executing any GAIA web tools requested by the model. This module adds the
+same usage instrumentation as magnetic_one, recording the complete
+request/response shape plus the tool evidence used during each logical
+LLM call.
 
 Usage:
     records = []
@@ -80,8 +76,7 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
         key_index = next((i for i, m in enumerate(model_list) if m is model), None)
         headers = {"authorization": f"Bearer {model['api_key']}"} if model.get("api_key") else None
         host = model.get("host", "http://localhost:11434")
-        is_openrouter = model.get("provider") == "openrouter"
-        client = None if is_openrouter else ollama.Client(host=host, headers=headers)
+        client = ollama.Client(host=host, headers=headers)
         options = {k: v for k, v in (("temperature", config.get("temperature")),
                                       ("num_predict", config.get("max_tokens")),
                                       ("seed", config.get("seed"))) if v is not None}
@@ -91,8 +86,8 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
 
         request_record = {
             "messages": to_jsonsafe(messages),
-            "tools": None,  # llm_debate's call_llm never passes tools to ollama.Client.chat
-            "tool_choice": None,
+            "tools": to_jsonsafe(langgraph_debate.gaia_utils.WEB_TOOL_DEFINITIONS) if call_type == "agent_turn" else [],
+            "tool_choice": "auto" if call_type == "agent_turn" else None,
             "json_output": None,
             "generation_options": to_jsonsafe(options),
             "temperature": config.get("temperature"),
@@ -104,7 +99,7 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
             "call_type": call_type,  # "agent_turn" | "reflection" | "trust_allocator" | "aggregate" | "corruption"
             "started_at": started_iso,
             "started_at_unix": started,
-            "provider": "openrouter" if is_openrouter else "ollama",
+            "provider": "ollama",
             "model": model.get("model"),
             "host": host,
             "key_identifier": mask_api_key(model.get("api_key"), key_index),
@@ -116,29 +111,52 @@ def _make_instrumented_call_llm(records: List[Dict[str, Any]]):
             "input_sources": [m.get("role") for m in messages],
             "context": model.get("model"),
         }
+        class _RecordingClient:
+            def __init__(self, inner):
+                self.inner = inner
+                self.responses = []
+                self.started = []
+                self.finished = []
+
+            def chat(self, **kwargs):
+                t0 = time.time()
+                response = self.inner.chat(**kwargs)
+                t1 = time.time()
+                self.responses.append(response)
+                self.started.append(t0)
+                self.finished.append(t1)
+                return response
+
         try:
-            if is_openrouter:
-                resp = langgraph_debate.openrouter_chat(model, messages, config)
-            else:
-                resp = client.chat(model=model["model"], messages=messages, options=options)
+            recorder = _RecordingClient(client)
+            tools = langgraph_debate.gaia_utils.WEB_TOOL_DEFINITIONS if call_type == "agent_turn" else []
+            content, _, raw_responses = langgraph_debate._chat_with_tools(
+                recorder, model["model"], messages, options, config, tools=tools
+            )
             finished = time.time()
-            message_obj = _field(resp, "message")
-            content = _field(message_obj, "content") if message_obj is not None else None
-            tool_calls = _field(message_obj, "tool_calls") if message_obj is not None else None
-            prompt_tokens = _field(resp, "prompt_eval_count")
-            completion_tokens = _field(resp, "eval_count")
+            prompt_counts = [_field(r, "prompt_eval_count") for r in raw_responses]
+            completion_counts = [_field(r, "eval_count") for r in raw_responses]
+            prompt_tokens = sum(v or 0 for v in prompt_counts) if any(v is not None for v in prompt_counts) else None
+            completion_tokens = sum(v or 0 for v in completion_counts) if any(v is not None for v in completion_counts) else None
             token_source = "ollama_native" if prompt_tokens is not None else "unavailable"
+            final_resp = raw_responses[-1] if raw_responses else None
+            final_message = _field(final_resp, "message") if final_resp is not None else None
+            final_tool_calls = _field(final_message, "tool_calls") if final_message is not None else None
             records.append({
                 **common,
                 "finished_at": trace_io.now_iso(),
                 "elapsed_seconds": finished - started,
                 "response": {
-                    "raw": to_jsonsafe(resp),
+                    "raw": to_jsonsafe(final_resp),
                     "generated_content": content,
-                    "tool_calls": to_jsonsafe(tool_calls) if tool_calls else None,
-                    "finish_info": {"done": _field(resp, "done"), "done_reason": _field(resp, "done_reason")},
-                    "metadata": {"created_at": _field(resp, "created_at"), "model": _field(resp, "model")},
+                    "tool_calls": to_jsonsafe(final_tool_calls) if final_tool_calls else None,
+                    "tool_rounds": to_jsonsafe(raw_responses[:-1]),
+                    "finish_info": {"done": _field(final_resp, "done") if final_resp is not None else None,
+                                    "done_reason": _field(final_resp, "done_reason") if final_resp is not None else None},
+                    "metadata": {"created_at": _field(final_resp, "created_at") if final_resp is not None else None,
+                                 "model": _field(final_resp, "model") if final_resp is not None else None},
                 },
+                "tool_events": to_jsonsafe(config.get("_last_tool_messages", [])),
                 "tokens": {
                     "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                     "total_tokens": (prompt_tokens or 0) + (completion_tokens or 0),
