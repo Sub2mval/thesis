@@ -140,11 +140,15 @@ def _chat_with_tools(client: Any, model_name: str, messages: List[Message], opti
     tool_messages: List[Message] = []
     raw_responses: List[Any] = []
     working = [dict(m) for m in messages]
+    config["_last_tool_messages"] = []
     tools = tools or []
     tool_round = 0
     max_tool_rounds = int(config.get("max_tool_rounds", 8))
     while True:
-        resp = client.chat(model=model_name, messages=working, tools=tools, options=options)
+        resp = client.chat(
+            model=model_name, messages=working, tools=tools, options=options,
+            think=True,
+        )
         raw_responses.append(resp)
         message = _field(resp, "message")
         content = _field(message, "content") or ""
@@ -192,7 +196,7 @@ def call_llm(messages: List[Message], config: Dict[str, Any], call_type: str = "
     options = {k: v for k, v in (("temperature", config.get("temperature")),
                                   ("num_predict", config.get("max_tokens")),
                                   ("seed", config.get("seed"))) if v is not None}
-    tools = gaia_utils.WEB_TOOL_DEFINITIONS if call_type == "agent_turn" else []
+    tools = gaia_utils.WEB_TOOL_DEFINITIONS if call_type in {"agent_turn", "corruption"} else []
     content, _, _ = _chat_with_tools(client, model["model"], messages, options, config, tools=tools)
     return content
 
@@ -311,6 +315,15 @@ class DebateState(TypedDict):
     # has run. This list is what actually preserves that per-message history.
     gricean_history: List[Dict[str, Any]]
     reflections: Dict[int, List[Dict[str, Any]]]
+    # Exact messages supplied to the most recent agent LLM call, before any
+    # tool calls are executed. This is the direct input to that agent's
+    # judged message; it does not recursively include inputs that produced
+    # earlier messages.
+    turn_contexts: Dict[int, List[Message]]
+    # Delivery-only inputs kept separately for compatibility/audit (currently
+    # private reflection). These never become part of a later permanent
+    # context.
+    turn_inputs: Dict[int, List[Message]]
     final_answer: Optional[str]
     config: Dict[str, Any]
     use_gricean_check: bool
@@ -359,7 +372,7 @@ def _build_initial_message(query: str, attachment: Optional[Dict[str, Any]]) -> 
 def init_agents(state: DebateState) -> Dict[str, Any]:
     msg = _build_initial_message(state["query"], state.get("attachment"))
     return {"contexts": [[dict(msg)] for _ in range(state["agents_num"])], "round": 0, "agent_idx": 0,
-            "adherence": {}, "gricean_history": [], "reflections": {}}
+            "adherence": {}, "gricean_history": [], "reflections": {}, "turn_contexts": {}, "turn_inputs": {}}
 
 
 def agent_turn(state: DebateState) -> Dict[str, Any]:
@@ -398,6 +411,8 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         contexts[i].append(broadcast)
 
     reflections = {k: list(v) for k, v in state["reflections"].items()}
+    turn_contexts = {k: list(v) for k, v in state.get("turn_contexts", {}).items()}
+    turn_inputs = {k: list(v) for k, v in state.get("turn_inputs", {}).items()}
     extra: List[Message] = []
     if flagged:
         reflection = call_llm([{"role": "user", "content": _reflection_prompt(state["query"], flagged)}],
@@ -413,6 +428,13 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
         })
         extra = [{"role": "user", "content": f"[Private reflection -- not part of the shared conversation]\n"
                                               f"{reflection}\n\nNow give your updated answer to the task."}]
+    turn_inputs[i] = list(extra)
+
+    # Snapshot the exact pre-call context for this turn. Tool results are
+    # recorded separately after the call and remain in contexts[i] for the
+    # Trust Allocator to inspect. Keeping this snapshot separate prevents
+    # later mutations from changing what the judged agent actually saw.
+    turn_contexts[i] = [dict(m) for m in (contexts[i] + extra)]
 
     state["config"].pop("_last_tool_messages", None)
     reply = call_llm(contexts[i] + extra, state["config"], call_type="agent_turn")
@@ -420,7 +442,7 @@ def agent_turn(state: DebateState) -> Dict[str, Any]:
     contexts[i].append({"role": "assistant", "content": reply})
     next_i = (i + 1) % state["agents_num"]
     return {"contexts": contexts, "agent_idx": next_i, "round": r + 1 if next_i == 0 else r,
-            "reflections": reflections}
+            "reflections": reflections, "turn_contexts": turn_contexts, "turn_inputs": turn_inputs}
 
 
 def _debate_client_for_allocator(
@@ -460,17 +482,32 @@ async def _trust_allocator_check(state: DebateState, speaker: int, ctx: List[Mes
     called when use_gricean_check is on -- see the baseline short-circuit
     in gricean_check() below."""
     design = state["experiment_design"]
-    # The initial per-agent user message may already contain the attachment
-    # payload. The allocator receives the attachment separately below, so do
-    # not duplicate that payload inside its conversational transcript.
+    # Judge exactly what this agent had available for the target response:
+    # its own direct pre-call context, any tool results from this turn, and
+    # the target response itself. Earlier messages remain content only;
+    # their own inputs/tool histories are NOT recursively copied in.
+    target_context = [dict(m) for m in state.get("turn_contexts", {}).get(speaker, [])]
+    if not target_context:
+        target_context = [dict(m) for m in ctx[:-1]]
     conversation_messages = []
-    for idx, m in enumerate(ctx):
-        if idx == 0 and m.get("role") == "user":
+    for m in target_context:
+        # The task is already supplied separately to the allocator, so avoid
+        # duplicating the seed message here. Other user messages are actual
+        # inputs delivered to this agent and are retained.
+        if not conversation_messages and m.get("role") == "user" and str(m.get("content", "")).startswith(state["query"]):
             continue
         source = m.get("role", "unknown")
         if source == "tool":
             source = f"tool:{m.get('tool_name', 'unknown')}"
         conversation_messages.append({"source": source, "content": m.get("content", "")})
+    # Tool messages are already in ctx, but when turn_contexts is available
+    # they are not yet present there; add this turn's recorded tool evidence.
+    target_tool_messages = [m for m in ctx if m.get("role") == "tool"]
+    seen_tool_contents = {m.get("content", "") for m in target_context if m.get("role") == "tool"}
+    for m in target_tool_messages:
+        if m.get("content", "") not in seen_tool_contents:
+            conversation_messages.append({"source": f"tool:{m.get('tool_name', 'unknown')}", "content": m.get("content", "")})
+    conversation_messages.append({"source": f"Agent {speaker + 1}", "content": ctx[-1].get("content", "")})
     conversation = format_conversation(conversation_messages)
     verdict = await allocate_trust(
         state["query"], conversation, f"Agent {speaker + 1}",
@@ -580,7 +617,7 @@ def run_debate(query: str, config: Dict[str, Any], agents_num: int = 3, rounds_n
         {"query": query, "agents_num": agents_num, "rounds_num": rounds_num, "round": 0, "agent_idx": 0,
          "contexts": [], "adherence": {}, "gricean_history": [], "reflections": {}, "final_answer": None,
          "config": config, "use_gricean_check": use_gricean_check, "attachment": attachment,
-         "experiment_design": experiment_design},
+         "experiment_design": experiment_design, "turn_contexts": {}, "turn_inputs": {}},
         config={"recursion_limit": 300},
     )
     return result

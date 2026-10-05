@@ -205,8 +205,13 @@ FAILURE MODE:
 TASK:
 {task}
 
-TARGET AGENT:
+TARGET AGENT / ROLE:
 {target_agent}
+
+The injector has the same task-solving capabilities as the target agent, including its
+web tools and access to any supplied GAIA attachment. Use those capabilities when needed.
+The corrupted response must look like something the TARGET AGENT itself could plausibly
+have produced while doing its assigned job.
 
 CONVERSATION SO FAR (raw agent outputs only, Trace A):
 {conversation}
@@ -327,7 +332,9 @@ def generate_corrupted_message(config: Dict[str, Any], task: str, agent_context:
                                 error_type: str, fm_id: Optional[str] = None,
                                 target_agent: Optional[str] = None,
                                 agent_outputs: Optional[List[Dict[str, str]]] = None,
-                                comparison_context: Optional[List[Message]] = None) -> Dict[str, Any]:
+                                comparison_context: Optional[List[Message]] = None,
+                                target_inputs: Optional[List[Message]] = None,
+                                target_tool_messages: Optional[List[Message]] = None) -> Dict[str, Any]:
     """Generate one role-aware corruption or return an INELIGIBLE result."""
     mode = choose_failure_mode(error_type, fm_id)
     target = agent_context[position]
@@ -376,13 +383,29 @@ def generate_corrupted_message(config: Dict[str, Any], task: str, agent_context:
             "The corruption will be injected into BOTH Trace A and Trace B. "
             "It must therefore be semantically valid for both target messages."
         )
+    target_inputs_text = _format_raw_messages(target_inputs or [], source_prefix="target_input") or "(no separately recorded direct inputs)"
+    target_tools_text = _format_raw_messages(target_tool_messages or [], source_prefix="target_tool") or "(no recorded tool results)"
     prompt = _CORRUPTION_PROMPT.format(
         fm_instruction=mode["instruction"], task=task,
         target_agent=target_agent or "the debate participant represented by this context",
         conversation=conversation, original_content=target_content,
         paired_section=paired_section,
+    ) + (
+        "\n\nDIRECT INPUTS AVAILABLE TO THE TARGET AGENT FOR THIS MESSAGE:\n"
+        f"{target_inputs_text}\n\n"
+        "TOOL RESULTS AVAILABLE TO THE TARGET AGENT FOR THIS MESSAGE:\n"
+        f"{target_tools_text}\n"
+        "Use these only to reproduce the target agent's observable working context. "
+        "Do not invent tool use that did not occur."
     )
-    response = call_llm([{"role": "user", "content": prompt}], config, call_type="corruption").strip()
+    # Give the injector the same multimodal task payload the target agent received.
+    injector_message: Message = {"role": "user", "content": prompt}
+    if agent_context:
+        seed = agent_context[0]
+        for key in ("images", "audio"):
+            if seed.get(key):
+                injector_message[key] = list(seed[key])
+    response = call_llm([injector_message], config, call_type="corruption").strip()
     lines = response.splitlines()
     marker = lines[0].strip().upper() if lines else ""
     if marker == "INELIGIBLE":
@@ -408,7 +431,12 @@ async def fork_trace_with_error(graph, config: Dict[str, Any], task: str, target
     original_content = contexts[agent_id][position]["content"]
 
     if corruption is None:
-        corruption = generate_corrupted_message(config, task, contexts[agent_id], position, error_type, fm_id)
+        target_inputs = (snapshot.values.get("turn_contexts", {}) or {}).get(agent_id)
+        corruption = generate_corrupted_message(
+            config, task, contexts[agent_id], position, error_type, fm_id,
+            target_agent=f"Agent {agent_id + 1}", target_inputs=target_inputs,
+            target_tool_messages=[m for m in contexts[agent_id] if m.get("role") == "tool"],
+        )
     if not corruption.get("eligible", True):
         raise ValueError(
             f"Selected injection target Agent {agent_id + 1} / position {position} is ineligible for "
@@ -604,6 +632,8 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
                     candidate_off["position"], error_type, selected_fm_id, target_agent=f"Agent {candidate_off['agent_id'] + 1}",
                     agent_outputs=_all_agent_outputs(candidate_off["snapshot"].values.get("contexts", [])),
                     comparison_context=candidate_on["snapshot"].values["contexts"][candidate_on["agent_id"]],
+                    target_inputs=(candidate_off["snapshot"].values.get("turn_contexts", {}) or {}).get(candidate_off["agent_id"]),
+                    target_tool_messages=[m for m in candidate_off["snapshot"].values["contexts"][candidate_off["agent_id"]] if m.get("role") == "tool"],
                 )
         else:
             candidate_corruption = generate_corrupted_message(
@@ -611,6 +641,8 @@ async def run_paired_fork_experiment(query: str, debate_config: Dict[str, Any], 
                 candidate_off["position"], error_type, selected_fm_id, target_agent=f"Agent {candidate_off['agent_id'] + 1}",
                 agent_outputs=_all_agent_outputs(candidate_off["snapshot"].values.get("contexts", [])),
                 comparison_context=candidate_on["snapshot"].values["contexts"][candidate_on["agent_id"]],
+                target_inputs=(candidate_off["snapshot"].values.get("turn_contexts", {}) or {}).get(candidate_off["agent_id"]),
+                target_tool_messages=[m for m in candidate_off["snapshot"].values["contexts"][candidate_off["agent_id"]] if m.get("role") == "tool"],
             )
         if candidate_corruption.get("eligible", True) and isinstance(candidate_corruption.get("content"), str) and candidate_corruption["content"].strip():
             target_off, target_on, corruption = candidate_off, candidate_on, candidate_corruption
